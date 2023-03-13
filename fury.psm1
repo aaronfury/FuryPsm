@@ -49,14 +49,14 @@ switch ( $Null ) {
 		if ( -not ( Test-Path ".\LOG\" ) ) {
 			New-Item -ItemType Directory -Path ".\LOG" | Out-Null
 		}
-		$script:Logfile = ".\LOG\$ScriptName $ScriptExecutionTimestamp.log"
+		$global:Logfile = ".\LOG\$ScriptName $ScriptExecutionTimestamp.log"
 	}
 	$OutputFile {
 		if ( $ScriptGeneratesOutputFile ) {
 			if ( -not ( Test-Path ".\OUTPUT\" ) ) {
 				New-Item -ItemType Directory -Path ".\OUTPUT" | Out-Null
 			}
-			$script:OutputFile = ".\OUTPUT\$ScriptName $ScriptExecutionTimestamp.csv"
+			$global:OutputFile = ".\OUTPUT\$ScriptName $ScriptExecutionTimestamp.csv"
 		}
 	}
 }
@@ -88,9 +88,9 @@ function Exit-Script {
 
 	Write-Log "Exiting script...`r`n"
 
-	if ( $SuperDebug ) {
-		Stop-Transcript
-	}
+	try {
+		[void](Stop-Transcript)
+	} catch {}
     
     if ( $Failed ) {
         exit -1
@@ -120,7 +120,7 @@ function Get-DC {
 }
 
 function Get-AllDCs {
-	Param (
+	param (
 		[array]$Domains = (Get-ADDomain).DNSRoot,
 		$ADSites,
 		[switch]$ForestWide,
@@ -128,8 +128,8 @@ function Get-AllDCs {
 		[switch]$DirectReturn
 	)
 
-	if ( -not $script:Scope ) {
-		$script:Scope = @{}
+	if ( -not $global:Scope ) {
+		$global:Scope = @{}
 	}
 
 	if ( $ForestWide ) {
@@ -162,7 +162,7 @@ function Get-AllDCs {
 					$DomainDCs = $DomainDCs.HostName
 				}
 
-				$script:Scope.Add( $Domain, $DomainDCs )
+				$global:Scope.Add( $Domain, $DomainDCs )
 				Write-Log "Found $( ($Scope.$Domain).Count ) domain controllers in $Domain"
 				break
 			} catch {
@@ -181,23 +181,63 @@ function Get-AllDCs {
 			$DCs += $Scope.$Domain
 		}
 
-		$script:Scope = $Null
+		$global:Scope = $Null
 
 		return $DCs
 	}
 }
 
-function Get-ComputerSite {
-	param( [string]$Computer )
+function Get-ComputerADSite {
+	param( [string[]]$Computers )
 
-	if ($Computer) {
-		$site = nltest /server:$Computer /dsgetsite 2 > $null
-		if ( -not $LASTEXITCODE ) { $site[0] } else { "ERROR" }
+	if ($Computers) {
+		$pinvoke = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class NetApi32 {
+    private class unmanaged {
+        [DllImport("NetApi32.dll", CharSet=CharSet.Auto, SetLastError=true)]
+        internal static extern UInt32 DsGetSiteName([MarshalAs(UnmanagedType.LPTStr)]string ComputerName, out IntPtr SiteNameBuffer);
+
+        [DllImport("NetApi32.dll", SetLastError=true)]
+        internal static extern int NetApiBufferFree(IntPtr Buffer);
+    }
+
+    public static string DsGetSiteName(string ComputerName) {
+        IntPtr siteNameBuffer = IntPtr.Zero;
+        UInt32 hResult = unmanaged.DsGetSiteName(ComputerName, out siteNameBuffer);
+        string siteName = Marshal.PtrToStringAuto(siteNameBuffer);
+        unmanaged.NetApiBufferFree(siteNameBuffer);
+        if(hResult == 0x6ba) { throw new Exception("Site information not found"); }
+        return siteName;
+    }
+}
+"@
+		Add-Type -TypeDefinition $pinvoke
+
+		$siteMap = @()
+
+		foreach ($computer in $Computers) {
+			try {
+				$siteName = [NetApi32]::DsGetSiteName($computer)
+			} catch {
+				Write-Log "Failed to retrieve the AD site for $computer" -Level ERROR
+			}
+			$siteMap += [pscustomobject][ordered]@{"Computer" = $computer; "SiteName" = $siteName}
+		}
+
+		if ($siteMap.Count -gt 1) {
+			return $siteMap
+		} else {
+			return $siteMap[0].SiteName
+		}
 	} else {
 		try {
 			[System.DirectoryServices.ActiveDirectory.ActiveDirectorySite]::GetComputerSite().Name
 		} catch {
-			"ERROR"
+			Write-Log "Failed to detect the local machine's AD site. The specific error is: $_" -Level ERROR
 		}
 	}
 }
@@ -270,26 +310,12 @@ function Get-Events {
 		[ValidateSet("Verbose","Info", "Warning", "Error", "Critical")][Parameter(ParameterSetName="LevelFilter")]$EventLevel = "Error",
 		[string]$LogName = "Application",
 		[int]$DaysToParse = 7,
-		$Computer
+		[array]$Computers
 	)
 
-	$Computers = @()
-	switch ( $true ) {
-		( $Computer -is [System.String] ) {
-			$Computers += $Computer
-			break
-		}
-		( $Computer -is [Microsoft.ActiveDirectory.Management.ADAccount] ) {
-			$Computers += $Computer.DNSHostName
-			break
-		}
-		( $Computer -is [System.Array] ) {
-			if ( $Computer[0] -is [System.String] ) {
-				$Computer | ForEach-Object{ $Computers += $_ }
-			} elseif ( $Computer[0] -is [Microsoft.ActiveDirectory.Management.ADAccount] ) {
-				$Computer | ForEach-Object{ $Computers += $_.DNSHostName }
-			}
-		}
+	if ( $Computer[0] -is [Microsoft.ActiveDirectory.Management.ADAccount] ) {
+		$Computers = $Computers.DNSHostName
+		break
 	}
 
 	$FilterHash = @{ LogName = $LogName; StartTime = (Get-Date).AddDays(-$DaysToParse); }
@@ -338,7 +364,8 @@ function Get-FileName {
 		$OpenFileDialog.Filter = "CSV Files (*.csv)| *.csv|All Files (*.*)| *.*"
 	}
 	$OpenFileDialog.ShowHelp = $true
-	$OpenFileDialog.ShowDialog() > $null
+	[void]($OpenFileDialog.ShowDialog())
+
 	return $OpenFileDialog.FileName
 }
 
@@ -362,78 +389,99 @@ function Get-IPAddress {
 
 function Get-RandomString {
 	param(
-		[int]$Length = 10,
-		[switch]$NumbersOnly,
-		[switch]$AlphaOnly,
-		[switch]$AlphaNumeric,
-		[switch]$Password,
-		[switch]$Complex,
-		[switch]$ExtraHard,
-		[switch]$AsSecureString
+		[Parameter()][int]$Length = 10,
+		[Parameter()][switch]$NumbersOnly,
+		[Parameter()][switch]$AlphaOnly,
+		[Parameter()][switch]$AlphaNumeric,
+		[Parameter(ParameterSetName="Password")][switch]$Password,
+		[Parameter(ParameterSetName="Password")][switch]$HumanFriendly,
+		[Parameter(ParameterSetName="Passphrase")][switch]$Passphrase,
+		[Parameter(ParameterSetName="Password")][Parameter(ParameterSetName="Passphrase")][switch]$ExtraHard,
+		[Parameter(ParameterSetName="Password")][switch]$AsSecureString
 	)
 
 	[string]$Random = $null
+	
+	$WordApiEndpoint = "https://random-word-api.herokuapp.com/word"
+	
+	$uppercase = (65..90) | ForEach-Object { [char][byte]$_	}
+	$lowercase = (97..122) | ForEach-Object { [char][byte]$_ }
+	$specials = (33,35,36,37,38,40,41,42,43,60,61,62,63,64,94,123,125,126) | ForEach-Object { [char][byte]$_ }
+	$numerals = (0..9)
+	
+	if ($Password) {
+		if ($HumanFriendly) {
+			if ($ExtraHard -and $Length -lt 14) {
+				$Length = 18
+			}
 
-	$SpecialCharacters = (33,35,36,37,38,40,41,42,43,60,61,62,63,64,94,123,125,126) | ForEach-Object { [char]$_ }
+			$Segments = @()
+			$segmentLength = ($Length - 3) / 3
+			$remainder = ($Length - 3) % 3
 
-	switch ( $true ) {
-		$NumbersOnly {
-			$sourcedata = (0..9)
-			break;
-		}
-		$AlphaOnly {
-			$sourcedata = $null
-			for ( $a = 65 ; $a –le 90; $a++ ) {
-				$sourcedata += ,[char][byte]$a
-			}
-			break;
-		}
-		$AlphaNumeric {
-			$sourcedata = (0..9)
-			for ( $a = 65 ; $a –le 90; $a++ ) {
-				$sourcedata += ,[char][byte]$a
-			}
-			break;
-		}
-		$Password {
-			$sourcedata = (0..9)
-			for ( $a = 65 ; $a –le 90; $a++ ) {
-				$sourcedata += ,[char][byte]$a
-			}
-			for ( $a = 97 ; $a –le 122; $a++ ) {
-				$sourcedata += ,[char][byte]$a
-			}
-			break;
-		}
-		default {
-			$sourcedata = $null
-			for ( $a = 33; $a –le 126; $a++ ) {
-				$sourcedata += ,[char][byte]$a
-			}
-		}
-	}
+			$uppercase,$lowercase,$numerals | ForEach-Object {
+				$segment = $null
+				for ($i=0; $i -le $segmentLength; $i++) {
+					$segment += $_ | Get-Random
+				}
 
-	if ( $Password ) {
-		if ( $ExtraHard ) {
-			if ( $Length -lt 14 ) { $Length = 14 }
-			$Length -= 4
+				if ($ExtraHard) {
+					$segment += $specials | Get-Random
+				}
+				
+				$Segments += ,$segment
+			}
+			
+			if ($remainder) {
+				for ($i=0; $i -lt $remainder; $i++) {
+					$Segments[2] += $numerals | Get-Random
+				}
+			}
+
+			$Random = $Segments -join "-"
 		} else {
-			$Length -= 2
+			if ($ExtraHard -and $Length -lt 14) {
+				$Length = 14
+			}
+
+			$sourcedata = $uppercase + $lowercase + $numerals + $specials
+			for ( $loop = 1; $loop -le $Length; $loop++ ) {
+				$Random += ( $sourcedata | Get-Random )
+			}
 		}
-		for ( $loop = 1; $loop –le $Length; $loop++ ) {
-			$Random += ( $sourcedata[10..61] | Get-Random )
+	} elseif ($Passphrase) {
+		(1..3) | ForEach-Object {
+			$word = (Invoke-RestMethod -Method Get -Uri $WordApiEndpoint)
+			$segment = $word.Substring(0,1).ToUpper() + $word.Substring(1)
+			if ($ExtraHard) {
+				$segment += $specials | Get-Random
+			}
+			$Segments += ,$segment
 		}
-		for ( $loop = 1; $loop –le 2; $loop++ ) {
-			$Random += ( $sourcedata[0..9] | Get-Random )
-		}
+
+		$Random = $Segments -join "-"
 	} else {
-		for ( $loop = 1; $loop –le $Length; $loop++ ) {
+		switch ( $true ) {
+			$NumbersOnly {
+				$sourcedata = $numerals
+				break;
+			}
+			$AlphaOnly {
+				$sourcedata = $uppercase + $lowercase
+				break;
+			}
+			$AlphaNumeric {
+				$sourcedata = $uppercase + $lowercase + $numerals
+				break;
+			}
+			default {
+				$sourcedata = $uppercase + $lowercase + $numerals + $specials
+			}
+		}
+		
+		for ( $loop = 1; $loop -le $Length; $loop++ ) {
 			$Random += ( $sourcedata | Get-Random )
 		}
-	}
-
-	if ( $ExtraHard -or $Complex ) {
-		(1..2) | ForEach-Object { $Random += (Get-Random $SpecialCharacters) }
 	}
 
 	if ( $AsSecureString ) {
@@ -442,22 +490,40 @@ function Get-RandomString {
 		return $Random
 	}
 }
+
 function Import-Settings {
-	try {
-		# Cleans up the file before converting it to JSON. Specifically, removes all "comments" and then makes sure that any commented-out items don't create dangling commas
-		$SettingsJson =  ( (Get-Content -Raw -Path $SettingsFile) -replace "//.*?\n","`n" ) -replace ",\n}","\n}"
-		$SettingsData = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
-	} catch {
-		Write-Log "This script is configured to use a Settings file ($SettingsFile), but it wasn't found or it is not formatted properly." -Fatal
-		exit
+	param(
+		[Parameter(Mandatory=$false)]$SettingsFile = "./settings.json",
+		[Parameter(Mandatory=$false)][ValidateSet("JSON","XML")]$FileFormat = "JSON"
+	)
+
+	if (-not (Test-Path -Path $SettingsFile)) {
+		Write-Log "Settings file $SettingsFile not found. Specify a file path using the -SettingsFile argument" -Level ERROR
+		return 1
+	}
+
+	switch ($FileFormat) {
+		"JSON" {
+			try {
+				# Cleans up the file before converting it to JSON. Specifically, removes all "comments" and then makes sure that any commented-out items don't create dangling commas
+				$SettingsJson =  ( (Get-Content -Raw -Path $SettingsFile) -replace "//.*?\n","`n" ) -replace ",\n}","\n}"
+				$SettingsData = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
+			} catch {
+				Write-Log "Error attempting to import a JSON settings file ($SettingsFile). The specific error is: $_" -Level ERROR
+				return 1
+			}
+		}
+		"XML" {
+			Write-Log "XML settings files are not yet supported. Just use JSON, weirdo."
+		}
 	}
 
 	if ( $SettingsData.settings ) {
 		Write-Log "Now reading in settings from $SettingsFile"
-		$Script:Settings = @{}
+		$global:Settings = @{}
 		foreach ( $setting in ($SettingsData.settings | Get-Member -Name * -MemberType NoteProperty).Name ) {
 			Try{
-				$Script:Settings[$setting] = $SettingsData.settings.$setting
+				$global:Settings[$setting] = $SettingsData.settings.$setting
 				Write-Log "Set variable $setting to $(Get-Variable $setting -ValueOnly)" -Level "VERBOSE"
 			} catch {
 				Write-Log "Could not configure setting $setting. Check the $SettingsFile file and try again" -Level "ERROR"
@@ -467,10 +533,10 @@ function Import-Settings {
 
 	if ( $SettingsData.variables ) {
 		Write-Log "Now reading in variable values from $SettingsFile."
-		$Script:Variables = @{}
+		$global:Variables = @{}
 		foreach ( $variable in ($SettingsData.variables | Get-Member -Name * -MemberType NoteProperty).Name ) {
 			Try{
-				$Script:Variables[$variable] = $SettingsData.variables.$variable
+				$global:Variables[$variable] = $SettingsData.variables.$variable
 				Write-Log "Set variable $variable to $(Get-Variable $variable -ValueOnly)" -Level "VERBOSE"
 			} catch {
 				Write-Log "Could not set variable $variable. Check the $SettingsFile file and try again" -Level "ERROR"
@@ -479,7 +545,7 @@ function Import-Settings {
 	}
 }
 
-function Initialize-Script {
+function Initialize-Module {
 	# Clear the error log
 	$Error.Clear()
 
@@ -506,7 +572,7 @@ function Initialize-Script {
 			if ( $ScriptInputFileType ) {
 				$iftSplat["CustomFileType"] = $ScriptInputFileType
 			}
-			$script:InputFile = Get-FileName @iftSplat
+			$global:InputFile = Get-FileName @iftSplat
 		}
 	}
 
@@ -569,7 +635,7 @@ function Initialize-Script {
 			}
 		}
 
-		$script:credSplat['Credential'] = $AdminCredential
+		$global:credSplat['Credential'] = $AdminCredential
 	}
 
 	# Check whether to set the -Whatif parameter on cmdlets that support it (custom functions should use the $TestRun variable directly to determine whether to make changes)
@@ -685,6 +751,34 @@ function Test-Connectivity {
 		}
 	} else {
 		return [bool]( Test-Connection -ComputerName $ComputerName -Count 2 -ErrorAction SilentlyContinue )
+	}
+}
+
+function Set-OutputLevel {
+	param(
+		[Parameter(Mandatory=$True)][ValidateSet("Normal","Verbose","Debug")]$Level
+	)
+
+	switch ($Level) {
+		"Normal" {
+			Write-Log "Disabling verbose output and stopping the transcription, if it is enabled"
+			$global:VerbosePreference = "Ignore"
+			try {
+				[void](Stop-Transcript -ErrorAction Stop)
+			} catch {}
+		}
+		"Verbose" {
+			Write-Log "Enabling verbose output for all cmdlets and stopping the transcription, it if is enabled"
+			$global:VerbosePreference = "Continue"
+			try {
+				[void](Stop-Transcript -ErrorAction Stop)
+			} catch {}
+		}
+		"Debug" {
+			Write-Log "Enabling verbose output for all cmdlets and transcribing all output to $($pwd.Path)\Debug.log"
+			$global:VerbosePreference = "Continue"
+			Start-Transcript -Path "./Debug.log" -Append
+		}
 	}
 }
 
@@ -822,27 +916,6 @@ function Write-Log {
 	}
 }
 
-# ======== END SCRIPT TEMPLATE ==========
+Initialize-Module
 
-# ======== CUSTOM FUNCTION DEFINITION ========
-
-# ======== END CUSTOM FUNCTION DEFINITION ========
-
-
-# ======== THE MAGIC ========
-
-if ( $DefaultToVerbose ) {
-	$VerbosePreference = continue
-}
-
-if ( $SuperDebug ) {
-	Start-Transcript -Path "Debug.log"
-	$DebugPreference = continue
-}
-
-Initialize-Script
-
-#INSERT MAGIC HERE
-
-Exit-Script
-# ======== END THE MAGIC ========
+Export-ModuleMember -Function *
