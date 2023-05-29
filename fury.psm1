@@ -12,7 +12,7 @@ param(
 	[Parameter(Mandatory=$false)]$AdminCredential = [System.Management.Automation.PSCredential]::Empty,
 	[Parameter(Mandatory=$false)]$AdminCredentialPassFile,
 	[Parameter(Mandatory=$false)][int]$MinPowerShellVersion = 3,
-	[Parameter(Mandatory=$false)][string]$SettingsFile = 'Settings.json',
+	[Parameter(Mandatory=$false)][string]$SettingsFile = 'settings.json',
 	[Parameter(Mandatory=$false)][switch]$SuperDebug
 )
 
@@ -29,7 +29,6 @@ $DefaultToVerbose = $false
 
 $NeedsModules = @() # An array of PS module names to load
 
-$ScriptHasSettingsFile = $true # Whether the script requires a Settings.json file to define parameters and variables
 $ScriptGeneratesOutputFile = $true # Whether an output file is generated (the log file is ALWAYS generated)
 
 $ScriptNeedsInputFile = $true # Whether the script requires a file to be specified using the -InputFile parameter
@@ -43,17 +42,18 @@ $MinPowerShellVersion = 5.0
 $ScriptName = $MyInvocation.MyCommand.Name -replace ".ps1",""
 $ScriptExecutionTime = Get-Date
 $ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
+$TranscriptFileName = "PS Transcript - $ScriptExecutionTimestamp.log"
 
-switch ( $Null ) {
+switch ($null) {
 	$Logfile {
-		if ( -not ( Test-Path ".\LOG\" ) ) {
+		if (-not (Test-Path ".\LOG\")) {
 			New-Item -ItemType Directory -Path ".\LOG" | Out-Null
 		}
 		$global:Logfile = ".\LOG\$ScriptName $ScriptExecutionTimestamp.log"
 	}
 	$OutputFile {
-		if ( $ScriptGeneratesOutputFile ) {
-			if ( -not ( Test-Path ".\OUTPUT\" ) ) {
+		if ($ScriptGeneratesOutputFile) {
+			if (-not (Test-Path ".\OUTPUT\")) {
 				New-Item -ItemType Directory -Path ".\OUTPUT" | Out-Null
 			}
 			$global:OutputFile = ".\OUTPUT\$ScriptName $ScriptExecutionTimestamp.csv"
@@ -66,9 +66,11 @@ $aDWSSplat = @{} # AD Web Services requirement (when finding a DC using certain 
 $eaSplat = @{ ErrorAction = "Stop" } # Error Action splat
 $testSplat = @{}
 
-$Settings = @() # Populated during the Load-Variables function
+$global:Settings = @() # Populated during the Import-Settings function
+$global:Variables = @() # Populated during the Import-Settings function
 
-$TotalProcessed = $TotalErrors = $TotalWarnings = 0
+$TotalErrors = $TotalWarnings = 0
+$ErrorsLogged = $false
 
 # ========== END SCRIPT CONSTANTS =============
 
@@ -84,7 +86,7 @@ function Convert-FileTime {
 function Exit-Script {
     param(
         [switch]$Failed
-    )
+   )
 
 	Write-Log "Exiting script...`r`n"
 
@@ -92,7 +94,12 @@ function Exit-Script {
 		[void](Stop-Transcript)
 	} catch {}
     
-    if ( $Failed ) {
+	if ($global:ErrorsLogged -and $global:Settings["EmailErrorReport"]) {
+		Write-Log "Sending log as email to $($EmailRecipients -join ",")"
+		New-Email -From $global:Settings["ErrorsEmailFromAddress"] -Recipients $global:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $global:Settings["ErrorsEmailSmtpServer"]
+	}
+
+    if ($Failed) {
         exit -1
     }
 
@@ -105,14 +112,14 @@ function Get-DC {
 		[switch]$ReturnDCNameOnly
 	)
 
-	if ( -not $Domain -or $Domain -eq "Root" ) {
+	if (-not $Domain -or $Domain -eq "Root") {
 		$Domain = (Get-ADForest).RootDomain
 	}
 
 	$DC = Get-ADDomainController -Discover -ForceDiscover -DomainName $Domain @aDWSSplat
-	Write-Log "Using domain controller $( $DC.HostName[0] ) for $Domain" -Level "VERBOSE"
+	Write-Log "Using domain controller $($DC.HostName[0]) for $Domain" -Level "VERBOSE"
 
-	if ( $ReturnDCNameOnly ) {
+	if ($ReturnDCNameOnly) {
 		return $DC.HostName[0]
 	} else {
 		return $DC
@@ -128,47 +135,47 @@ function Get-AllDCs {
 		[switch]$DirectReturn
 	)
 
-	if ( -not $global:Scope ) {
+	if (-not $global:Scope) {
 		$global:Scope = @{}
 	}
 
-	if ( $ForestWide ) {
-		$ForestRoot = ( Get-ADDomain $Domains[0] ).Forest
-		$Domains = ( Get-ADForest $ForestRoot ).Domains
+	if ($ForestWide) {
+		$ForestRoot = (Get-ADDomain $Domains[0]).Forest
+		$Domains = (Get-ADForest $ForestRoot).Domains
 		Write-Log "Enumerating DCs in forest $ForestRoot"
 	} else {
 		Write-Log "Enumerating DCs in $Domains..."
 	}
 
-	foreach ( $Domain in $Domains ) {
-		for ( $i = 1; $i -le 3; $i++ ) {
+	foreach ($Domain in $Domains) {
+		for ($i = 1; $i -le 3; $i++) {
 			try {
-				$ConnectionDC = ( Get-ADDomainController -DomainName $Domain -ForceDiscover -Discover @aDWSSplat ).HostName[0]
+				$ConnectionDC = (Get-ADDomainController -DomainName $Domain -ForceDiscover -Discover @aDWSSplat).HostName[0]
 				Write-Log "Using DC $ConnectionDC for enumeration" -Level "VERBOSE"
 				[array]$DomainDCs = Get-ADDomainController -Filter * -Server $ConnectionDC @eaSplat
-				if ( $ADSites ) {
-					if ( $ADSites -is [array] ) {
-						if ( $($ADSites -join " ").ToCharArray() -contains "*" ) {
+				if ($ADSites) {
+					if ($ADSites -is [array]) {
+						if ($($ADSites -join " ").ToCharArray() -contains "*") {
 							Write-Log "if multiple AD sites are specified, wildcards may not be used." -Level "ERROR"
 							Throw "Invalid -ADSites parameter. Do not use wildcards if specifying an array of site names."
 						}
 						$DomainDCs = $DomainDCs | Where-Object { $ADSites -contains $_.Site }
 					} else {
-						$DomainDCs = $DomainDCs | Where-Object { $_.Site -like $( if ( $ADSites.ToCharArray() -contains "`*" ) { $ADSites } else { "$ADSites*" } ) }
+						$DomainDCs = $DomainDCs | Where-Object { $_.Site -like $(if ($ADSites.ToCharArray() -contains "`*") { $ADSites } else { "$ADSites*" }) }
 					}
 				}
 
-				if ( $DCNamesOnly ){
+				if ($DCNamesOnly){
 					$DomainDCs = $DomainDCs.HostName
 				}
 
-				$global:Scope.Add( $Domain, $DomainDCs )
-				Write-Log "Found $( ($Scope.$Domain).Count ) domain controllers in $Domain"
+				$global:Scope.Add($Domain, $DomainDCs)
+				Write-Log "Found $(($Scope.$Domain).Count) domain controllers in $Domain"
 				break
 			} catch {
 				Write-Log "Could not enumerate DCs in $Domain... Attempt $i of 3" -Level "ERROR"
 				Write-Log $_ -Level "ERROR"
-				if ( $i -eq 3 ) {
+				if ($i -eq 3) {
 					Write-Log "$Domain is being skipped..." -Level "ERROR"
 					break
 				}
@@ -176,8 +183,8 @@ function Get-AllDCs {
 		}
 	}
 
-	if ( $DirectReturn){
-		foreach ( $Domain in $Scope.Keys ){
+	if ($DirectReturn){
+		foreach ($Domain in $Scope.Keys){
 			$DCs += $Scope.$Domain
 		}
 
@@ -188,7 +195,7 @@ function Get-AllDCs {
 }
 
 function Get-ComputerADSite {
-	param( [string[]]$Computers )
+	param([string[]]$Computers)
 
 	if ($Computers) {
 		$pinvoke = @"
@@ -250,31 +257,31 @@ function Get-Confirmation {
 		[string]$CustomOptions
 	)
 
-	if ( $CustomOptions ) {
-		if ( $CustomOptions -cmatch "[A-Z]") {
+	if ($CustomOptions) {
+		if ($CustomOptions -cmatch "[A-Z]") {
 			$DefaultOption = $Matches[0]
 		}
 		$Options = $CustomOptions -split ","
 
-		$confirmation = Read-Host "$Message`n[$( $Options -join "/")]"
+		$confirmation = Read-Host "$Message`n[$($Options -join "/")]"
 
-		if ( $DefaultOption -and ($confirmation -eq "") ) {
+		if ($DefaultOption -and ($confirmation -eq "")) {
 			return $DefaultOption
 		}
 
-		while ( $Options -notcontains $confirmation ) {
-			$confirmation = Read-Host "Invalid option. `n$Message`n[$( $Options -join " / ")]"
+		while ($Options -notcontains $confirmation) {
+			$confirmation = Read-Host "Invalid option. `n$Message`n[$($Options -join " / ")]"
 		}
 		return $confirmation
 	} else {
-		if ( $DefaultToYes ) { $YesVar = "Y" } else { $YesVar = "y" }
+		if ($DefaultToYes) { $YesVar = "Y" } else { $YesVar = "y" }
 
 		do {
 			$confirmation = Read-Host "$Message [$YesVar/n]"
 
-			switch ( $confirmation ) {
+			switch ($confirmation) {
 				"n" {
-					if ( $ExitOnNo ) {
+					if ($ExitOnNo) {
 						Write-Log "User declined confirmation." -Level "ERROR" -Fatal
 					} else {
 						return $false
@@ -285,10 +292,10 @@ function Get-Confirmation {
 					return $true
 				}
 				default {
-					if ( $DefaultToYes -and ($confirmation -eq "") ) { return $true }
+					if ($DefaultToYes -and ($confirmation -eq "")) { return $true }
 				}
 			}
-		} while ( -not $validInput )
+		} while (-not $validInput)
 	}
 }
 
@@ -313,14 +320,14 @@ function Get-Events {
 		[array]$Computers
 	)
 
-	if ( $Computer[0] -is [Microsoft.ActiveDirectory.Management.ADAccount] ) {
+	if ($Computer[0] -is [Microsoft.ActiveDirectory.Management.ADAccount]) {
 		$Computers = $Computers.DNSHostName
 		break
 	}
 
 	$FilterHash = @{ LogName = $LogName; StartTime = (Get-Date).AddDays(-$DaysToParse); }
-	if ( $EventID ) {
-		$FilterHash.Add( "ID", $EventID )
+	if ($EventID) {
+		$FilterHash.Add("ID", $EventID)
 	} else {
 		$EventID = "All events"
 	}
@@ -332,12 +339,12 @@ function Get-Events {
 		"Error" = 2;
 		"Critical" = 1;
 	}
-	$FilterHash.Add( "Level", $LevelIDs[$EventLevel] )
+	$FilterHash.Add("Level", $LevelIDs[$EventLevel])
 
-	foreach ( $computer in $Computers ) {
+	foreach ($computer in $Computers) {
 		try {
 			$Events = Get-WinEvent -ComputerName $computer -FilterHashtable $FilterHash @credSplat -ErrorAction SilentlyContinue -Verbose:$false | Select-Object MachineName,Id,Message,ProviderName
-			foreach ( $event in $Events ) {
+			foreach ($event in $Events) {
 				Write-Data -Record $event -Output "EventLogs - $EventID.csv"
 			}
 		} catch {
@@ -358,7 +365,7 @@ function Get-FileName {
 
 	$OpenFileDialog = New-Object System.Windows.Forms.OpenFileDialog
 	# $OpenFileDialog.InitialDirectory = $initialDirectory
-	if ( $CustomFileType ) {
+	if ($CustomFileType) {
 		$OpenFileDialog.Filter = "Custom File Type (*.$CustomFileType)| *.$CustomFileType|All Files (*.*)| *.*"
 	} else {
 		$OpenFileDialog.Filter = "CSV Files (*.csv)| *.csv|All Files (*.*)| *.*"
@@ -370,13 +377,13 @@ function Get-FileName {
 }
 
 function Get-IPAddress {
-	Param ( $Computer )
+	Param ($Computer)
 	$return = @()
 
-	foreach ( $target in $Computer ) {
-		if ( $Computer[0] -is [System.String] ) {
+	foreach ($target in $Computer) {
+		if ($Computer[0] -is [System.String]) {
 			$ComputerName = $target
-		} elseif ( $Computer[0] -match [Microsoft.ActiveDirectory.Management.ADComputer]$temp ) {
+		} elseif ($Computer[0] -match [Microsoft.ActiveDirectory.Management.ADComputer]$temp) {
 			$ComputerName = $target.Name
 		}
 
@@ -385,6 +392,23 @@ function Get-IPAddress {
 	}
 
 	return $return
+}
+
+function Get-SecurityPrincipalBySID {
+	param($SID)
+
+	try {
+		if ($SID -isnot [System.Security.Principal.SecurityIdentifier]) {
+			$SID = New-Object System.Security.Principal.SecurityIdentifier($SID)
+		}
+		$User = $SID.Translate([System.Security.Principal.NTAccount])
+		$Username = $User.Value
+	} catch {
+		Write-Log "Could not resolve $SID to a username" -Level "WARNING"
+		$Username = "UNKNOWN ($SID)"
+	}
+
+	return $Username
 }
 
 function Get-RandomString {
@@ -445,8 +469,8 @@ function Get-RandomString {
 			}
 
 			$sourcedata = $uppercase + $lowercase + $numerals + $specials
-			for ( $loop = 1; $loop -le $Length; $loop++ ) {
-				$Random += ( $sourcedata | Get-Random )
+			for ($loop = 1; $loop -le $Length; $loop++) {
+				$Random += ($sourcedata | Get-Random)
 			}
 		}
 	} elseif ($Passphrase) {
@@ -461,7 +485,7 @@ function Get-RandomString {
 
 		$Random = $Segments -join "-"
 	} else {
-		switch ( $true ) {
+		switch ($true) {
 			$NumbersOnly {
 				$sourcedata = $numerals
 				break;
@@ -479,12 +503,12 @@ function Get-RandomString {
 			}
 		}
 		
-		for ( $loop = 1; $loop -le $Length; $loop++ ) {
-			$Random += ( $sourcedata | Get-Random )
+		for ($loop = 1; $loop -le $Length; $loop++) {
+			$Random += ($sourcedata | Get-Random)
 		}
 	}
 
-	if ( $AsSecureString ) {
+	if ($AsSecureString) {
 		return (ConvertTo-SecureString -AsPlainText -Force -String $Random)
 	} else {
 		return $Random
@@ -493,7 +517,6 @@ function Get-RandomString {
 
 function Import-Settings {
 	param(
-		[Parameter(Mandatory=$false)]$SettingsFile = "./settings.json",
 		[Parameter(Mandatory=$false)][ValidateSet("JSON","XML")]$FileFormat = "JSON"
 	)
 
@@ -506,7 +529,7 @@ function Import-Settings {
 		"JSON" {
 			try {
 				# Cleans up the file before converting it to JSON. Specifically, removes all "comments" and then makes sure that any commented-out items don't create dangling commas
-				$SettingsJson =  ( (Get-Content -Raw -Path $SettingsFile) -replace "//.*?\n","`n" ) -replace ",\n}","\n}"
+				$SettingsJson =  ((Get-Content -Raw -Path $SettingsFile) -replace "//.*?\n","`n") -replace ",\n}","\n}"
 				$SettingsData = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
 			} catch {
 				Write-Log "Error attempting to import a JSON settings file ($SettingsFile). The specific error is: $_" -Level ERROR
@@ -518,26 +541,26 @@ function Import-Settings {
 		}
 	}
 
-	if ( $SettingsData.settings ) {
+	if ($SettingsData.settings) {
 		Write-Log "Now reading in settings from $SettingsFile"
 		$global:Settings = @{}
-		foreach ( $setting in ($SettingsData.settings | Get-Member -Name * -MemberType NoteProperty).Name ) {
-			Try{
+		foreach ($setting in ($SettingsData.settings | Get-Member -Name * -MemberType NoteProperty).Name) {
+			try {
 				$global:Settings[$setting] = $SettingsData.settings.$setting
-				Write-Log "Set variable $setting to $(Get-Variable $setting -ValueOnly)" -Level "VERBOSE"
+				Write-Log "Set setting `$Settings[$setting] to $(Get-Variable $setting -ValueOnly)" -Level "VERBOSE"
 			} catch {
 				Write-Log "Could not configure setting $setting. Check the $SettingsFile file and try again" -Level "ERROR"
 			}
 		}
 	}
 
-	if ( $SettingsData.variables ) {
+	if ($SettingsData.variables) {
 		Write-Log "Now reading in variable values from $SettingsFile."
 		$global:Variables = @{}
-		foreach ( $variable in ($SettingsData.variables | Get-Member -Name * -MemberType NoteProperty).Name ) {
-			Try{
+		foreach ($variable in ($SettingsData.variables | Get-Member -Name * -MemberType NoteProperty).Name) {
+			try {
 				$global:Variables[$variable] = $SettingsData.variables.$variable
-				Write-Log "Set variable $variable to $(Get-Variable $variable -ValueOnly)" -Level "VERBOSE"
+				Write-Log "Set variable `$Variables[$variable] to $(Get-Variable $variable -ValueOnly)" -Level "VERBOSE"
 			} catch {
 				Write-Log "Could not set variable $variable. Check the $SettingsFile file and try again" -Level "ERROR"
 			}
@@ -549,27 +572,31 @@ function Initialize-Module {
 	# Clear the error log
 	$Error.Clear()
 
+	if ($SuperDebug) {
+		Start-Transcript -Path $TranscriptFileName
+	}
+
 	# Foremost, see if there's a Settings.json file and load it.
-	if ( $ScriptHasSettingsFile ) {
+	if (Test-Path $SettingsFile) {
 		Import-Settings
 	}
 
 	# Check if the log file already exists; if not, create it
-	if ( -not ( Test-Path $LogFile ) ) {
+	if (-not (Test-Path $LogFile)) {
 		New-Item -Path $LogFile -ItemType File -Force | Out-Null
 	}
 
 	Write-Log "Initializing $ScriptName..."
 
-	if ($MinPowerShellVersion -and $PSVersionTable.PSVersion.ToString() -lt $MinPowerShellVersion ) {
+	if ($MinPowerShellVersion -and $PSVersionTable.PSVersion.ToString() -lt $MinPowerShellVersion) {
 		Write-Log "This script requires Microsoft PowerShell version $MinPowerShellVersion or later to run. Please install the latest version of the Windows Management Framework or the PowerShell standalone component and run this script again. Sowwy." -Fatal
 	}
 
 	# Check for the input file, if one is specified in the script
-	if ( $ScriptNeedsInputFile ) {
-		if ( -not $InputFile ) {
+	if ($ScriptNeedsInputFile) {
+		if (-not $InputFile) {
 			$iftSplat = @{}
-			if ( $ScriptInputFileType ) {
+			if ($ScriptInputFileType) {
 				$iftSplat["CustomFileType"] = $ScriptInputFileType
 			}
 			$global:InputFile = Get-FileName @iftSplat
@@ -577,7 +604,7 @@ function Initialize-Module {
 	}
 
 	# Check if the output path already exists; if not, create it
-	if ( -not ( Test-Path ".\OUTPUT\" ) ) {
+	if (-not (Test-Path ".\OUTPUT\")) {
 		try {
 			Write-Host "Creating log file..."
 			New-Item -Path $LogFile -ItemType file | Out-Null
@@ -590,21 +617,21 @@ function Initialize-Module {
 	}
 
 	# Check if the output file already exists; if so, prompt to overwrite.
-	if ( $ScriptGeneratesOutputFile ) {
-		if ( Test-Path $OutputFile ) {
-			if ( ( Read-Host "Specified output file $OutputFile exists. Overwrite? [Y/N]" ) -ne "Y" ) {
+	if ($ScriptGeneratesOutputFile) {
+		if (Test-Path $OutputFile) {
+			if ((Read-Host "Specified output file $OutputFile exists. Overwrite? [Y/N]") -ne "Y") {
 				Write-Log "Specified output file exists" -Level "ERROR" -Fatal
 			} else {
 				Write-Log "Overwriting output file '$OutputFile'"
 			}
 		}
 		New-Item -Path $OutputFile -ItemType File | Out-Null
-		"`"" + $( $OutputHeaders -join "`",`"" ) + "`"" | Out-File $OutputFile -Encoding UTF8 # Pre-populate the headers in the output file, to make sure they are not constrained to the headers of the first record
+		"`"" + $($OutputHeaders -join "`",`"") + "`"" | Out-File $OutputFile -Encoding UTF8 # Pre-populate the headers in the output file, to make sure they are not constrained to the headers of the first record
 	}
 
 
-	foreach ( $module in $NeedsModules ) {
-		if ( -not (Get-Module $module) ) {
+	foreach ($module in $NeedsModules) {
+		if (-not (Get-Module $module)) {
 			try {
 				Import-Module $module -ErrorAction Stop
 				Write-Log "Loaded module $module." -Level "VERBOSE"
@@ -615,17 +642,17 @@ function Initialize-Module {
 	}
 
 	# Check if alternate admin credentials are to be used
-	if ( $UseAdminCredential ) {
-		switch ( $true ) {
-			( $AdminCredentialPassFile ) {
+	if ($UseAdminCredential) {
+		switch ($true) {
+			($AdminCredentialPassFile) {
 				$AdminPass = Get-Content $AdminCredentialPassFile | ConvertTo-SecureString
 			}
-			( $AdminCredential -isnot [System.Management.Automation.PSCredential] ) {
+			($AdminCredential -isnot [System.Management.Automation.PSCredential]) {
 				Write-Log "if using the -AdminCredential parameter, please pass a PSCredential object. Or omit the -AdminCredential parameter to be prompted for credentials" -Level "ERROR" -Fatal
 				break
 			}
-			( $AdminCredential -eq [System.Management.Automation.PSCredential]::Empty ) {
-				if ( $AdminPass ) {
+			($AdminCredential -eq [System.Management.Automation.PSCredential]::Empty) {
+				if ($AdminPass) {
 					$AdminUsername = Read-Host "Password read from $AdminCredentialPassFile. Please specify the username to use"
 					$AdminCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $AdminUsername,$AdminPass
 				} else {
@@ -639,7 +666,7 @@ function Initialize-Module {
 	}
 
 	# Check whether to set the -Whatif parameter on cmdlets that support it (custom functions should use the $TestRun variable directly to determine whether to make changes)
-	if ( $TestRun ) {
+	if ($TestRun) {
 		$testSplat["Whatif"] = $true
 	}
 
@@ -649,9 +676,9 @@ function Initialize-Module {
 	Start-Sleep -Seconds 1
 
 	# if there are any logs, pause for review
-	if ( $Error.Count ) {
+	if ($Error.Count) {
 		Write-Log "Initialization errors encountered." -Level "ERROR"
-		if ( Get-Confirmation "Continue loading the script?" ) {
+		if (Get-Confirmation "Continue loading the script?") {
 			return
 		} else {
 			Exit-Script
@@ -659,24 +686,7 @@ function Initialize-Module {
 	}
 }
 
-function Resolve-SID {
-	param( $SID )
-
-	try {
-		if ( $SID -isnot [System.Security.Principal.SecurityIdentifier] ) {
-			$SID = New-Object System.Security.Principal.SecurityIdentifier( $SID )
-		}
-		$User = $SID.Translate( [System.Security.Principal.NTAccount] )
-		$Username = $User.Value
-	} catch {
-		Write-Log "Could not resolve $SID to a username" -Level "WARNING"
-		$Username = "UNKNOWN ($SID)"
-	}
-
-	return $Username
-}
-
-function Send-Email {
+function New-Email {
 	param(
 		[string]$From,
 		$Recipients,
@@ -692,7 +702,7 @@ function Send-Email {
 		$Attachments
 	)
 
-	$DefaultSubject = "$ScriptName Email - $( Get-Date -Format "yyyy/MM/dd hh:mm:ss tt" )"
+	$DefaultSubject = "$ScriptName Email - $(Get-Date -Format "yyyy/MM/dd hh:mm:ss tt")"
 	$DefaultBody = @"
 <div style="font-family: Calibri, sans-serif !important; color: #606060 !important;">
 	<h1>$MessageHeader</h1>
@@ -704,38 +714,39 @@ function Send-Email {
 		To = $Recipients;
 		SmtpServer = $SmtpServer;
 		#UseSSL = $true;
-		Subject = $( if ( $Subject ) { $Subject } else { $DefaultSubject } );
-		Body = $( if ( $CustomFullBody ) { $CustomFullBody } else { $DefaultBody } )
+		Subject = $(if ($Subject) { $Subject } else { $DefaultSubject });
+		Body = $(if ($CustomFullBody) { $CustomFullBody } else { $DefaultBody })
 		BodyAsHtml = $true;
 	}
 
-	if ( $CCRecipients ) {
-		if ( $CCRecipients -is [string] ) {
+	if ($CCRecipients) {
+		if ($CCRecipients -is [string]) {
 			$CCRecipients = $CCRecipients -split ";"
 		}
-		$MessageParams.Add( "Cc", $CCRecipients )
+		$MessageParams.Add("Cc", $CCRecipients)
 	}
-	if ( $BCCRecipients ) {
-		if ( $BCCRecipients -is [string] ) {
+	if ($BCCRecipients) {
+		if ($BCCRecipients -is [string]) {
 			$BCCRecipients = $BCCRecipients -split ";"
 		}
-		$MessageParams.Add( "Bcc", $BCCRecipients )
+		$MessageParams.Add("Bcc", $BCCRecipients)
 	}
 
-	switch ( $true ) {
+	switch ($true) {
 		$AttachLogFile { $Attachments += ,(Get-Item -Path $LogFile).FullName }
 		$AttachOutputFile { $Attachments += ,(Get-Item -Path $OutputFile).FullName }
 	}
-	if ( $Attachments ) { $MessageParams.Add( "Attachments", $Attachments ) }
+	if ($Attachments) { $MessageParams.Add("Attachments", $Attachments) }
 
 	try {
-		Write-Log "Emailing report to $( $Recipients -join "," )..."
+		Write-Log "Emailing report to $($Recipients -join ",")..."
 		Send-MailMessage @MessageParams @credSplat
 	} catch {
 		Write-Log "Could not send report email. Check the parameters for the next iteration of the script." -Level "ERROR"
-		Write-Log "Line $( $_.InvocationInfo.ScriptLineNumber ) - $_" -Level "ERROR"
+		Write-Log "Line $($_.InvocationInfo.ScriptLineNumber) - $_" -Level "ERROR"
 	}
 }
+
 
 function Test-Connectivity {
 	param(
@@ -743,14 +754,14 @@ function Test-Connectivity {
 		[int]$Port
 	)
 
-	if ( $Port ) {
+	if ($Port) {
 		try {
-			return ( New-Object System.Net.Sockets.TCPClient -ArgumentList $ComputerName, $Port -ErrorAction SilentlyContinue ).Connected
+			return (New-Object System.Net.Sockets.TCPClient -ArgumentList $ComputerName, $Port -ErrorAction SilentlyContinue).Connected
 		} catch {
 			return $false
 		}
 	} else {
-		return [bool]( Test-Connection -ComputerName $ComputerName -Count 2 -ErrorAction SilentlyContinue )
+		return [bool](Test-Connection -ComputerName $ComputerName -Count 2 -ErrorAction SilentlyContinue)
 	}
 }
 
@@ -791,9 +802,9 @@ function Start-ConfirmationTimer {
 
 	Write-Host -NoNewline "$Message"
 
-	while ( $secondsToWait -ge 0 ) {
-		if ( -not [console]::KeyAvailable ) {
-			if ( $OnlyShowDots ) {
+	while ($secondsToWait -ge 0) {
+		if (-not [console]::KeyAvailable) {
+			if ($OnlyShowDots) {
 				Write-Host -NoNewLine "."
 			} else {
 				Write-Host -NoNewline " $secondsToWait..."
@@ -809,9 +820,9 @@ function Start-ConfirmationTimer {
 	return $true # NO intervention
 }
 function Wait-Input {
-	param( [string]$Message="Press any key to continue..." )
+	param([string]$Message="Press any key to continue...")
 
-	if ( $psISE ) { # The "ReadKey" functionality is not supported in Windows PowerShell ISE
+	if ($psISE) { # The "ReadKey" functionality is not supported in Windows PowerShell ISE
 		Write-Host "`n$Message`n"
 		$Shell = New-Object -ComObject "WScript.Shell"
 		$Shell.Popup($Message, 0, "Script Paused", 0)
@@ -822,7 +833,7 @@ function Wait-Input {
 
 	$Ignore = 16,17,18,20,91,92,93,144,145,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183
 
-	while ( $null -eq $KeyInfo.VirtualKeyCode -or $Ignore -contains $KeyInfo.VirtualKeyCode) {
+	while ($null -eq $KeyInfo.VirtualKeyCode -or $Ignore -contains $KeyInfo.VirtualKeyCode) {
 			$KeyInfo = $Host.UI.RawUI.ReadKey("NoEcho, IncludeKeyDown")
 	}
 }
@@ -835,15 +846,15 @@ function Write-Data {
 		[Parameter(Mandatory=$false, Position=3)][bool]$Force = $false
 	)
 
-	if ( $Record -is [hashtable] ) {
+	if ($Record -is [hashtable]) {
 		$Record = [pscustomobject]$Record
 	}
 
-	if ( -not (Test-Path $Output) ) {
+	if (-not (Test-Path $Output)) {
 		Write-Log "Output file $Output did not exist. Creating..." -Level "VERBOSE"
-		if ( $Output -like "*\*") {
+		if ($Output -like "*\*") {
 			$ParentPath = Split-Path $Output
-			if (-not (Test-Path "$ParentPath\") ) {
+			if (-not (Test-Path "$ParentPath\")) {
 				try {
 					New-Item -ItemType Directory -Path $ParentPath -Force | Out-Null
 				} catch {
@@ -854,7 +865,7 @@ function Write-Data {
 		}
 	}
 
-	switch ( $WriteType ) {
+	switch ($WriteType) {
 		"csv" {
 			$Record | Export-Csv -Append -Path $Output -NoTypeInformation -Force -Encoding ASCII
 		}
@@ -877,17 +888,17 @@ function Write-Log {
 	)
 
 	# Ignore VERBOSE entries if the "Verbose" flag is not set
-	if ( $Level -eq "VERBOSE" -and $VerbosePreference -ne "Continue" ) { return }
+	if ($Level -eq "VERBOSE" -and $VerbosePreference -ne "Continue") { return }
 
-	if ( $Separator ) {
+	if ($Separator) {
 		"`r`n--------------------`r`n" | Add-Content $LogFile
 		return
 	}
 
 	$Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-	if ( $Message -is [System.Management.Automation.ErrorRecord] ) {
-		if ( $Level -eq "INFO" ) {
+	if ($Message -is [System.Management.Automation.ErrorRecord]) {
+		if ($Level -eq "INFO") {
 			$Level = "ERROR"
 		}
 		$Output = "$Level`t: $Message at line $($Message.InvocationInfo.ScriptLineNumber)"
@@ -895,11 +906,11 @@ function Write-Log {
 		$Output = "$Level`t: $Message"
 	}
 
-	if ( -not $Silent ) {
+	if (-not $Silent) {
 		# Set the color for the console output and update counters
-		switch ( $Level ) {
+		switch ($Level) {
 			"WARNING" { $Color = "Yellow"; $TotalWarnings++; break }
-			"ERROR" { $Color = "Red"; $TotalErrors++; break }
+			"ERROR" { $Color = "Red"; $ErrorsLogged = $true; $TotalErrors++; break }
 			"VERBOSE" { $Color = "Gray"; break }
 			default { $Color = "White" }
 		}
@@ -909,7 +920,12 @@ function Write-Log {
 
 	"$Timestamp`t$Output" | Add-Content $LogFile
 
-	if ( $Fatal ) {
+	if ($Level -eq "ERROR" -and $global:Settings["ErrorThreshold"] -and $global:TotalErrors -gt $global:Settings["ErrorThreshold"]) {
+		"ERROR THRESHOLD EXCEEDED: The script has encountered more than $($global:Settings["ErrorThreshold"]) errors and will now terminate." | Add-Content $LogFile
+		Exit-Script -Failed
+	}
+
+	if ($Fatal) {
 		"FATAL: The previous error was fatal. The script will now exit." | Add-Content $LogFile
 		Write-Host "FATAL: The previous error was fatal. The script will now poop the bed." -Fore Red
 		Exit-Script -Failed

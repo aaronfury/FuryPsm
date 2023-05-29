@@ -1,0 +1,13 @@
+{
+	"settings" : {
+		"ErrorThreshold" : 0, // If this is set to a positive integer, the script will terminate once this number of errors is logged using the Write-Log function
+		"EmailOnErrors" : false, // If set to true, the module will attempt to send the script's log file to the email address
+		"ErrorsEmailSmtpServer" : "", // Must allow open relay. Authenticated user support coming later.
+		"ErrorsEmailFromAddress" : "", // The "From:" address to stamp on the errors email
+		"ErrorsEmailRecipients" : "" // A comma-separated list of email addresses
+		// You can specify any custom settings here. The module will automatically load them into the $Settings variable
+	},
+	"variables" : {
+		// You can specify any custom variables here. The module will automatically load them into the $Variables variable
+	}
+}
