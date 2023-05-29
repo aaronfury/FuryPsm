@@ -2,6 +2,7 @@
 A PowerShell Module with useful functions
 
 # Changelog
+- 23.0529 : Reintroduced settings file support. This whole thing still needs a lot of work to be a module. For now, consider it a code reference...
 - 23.0306 : This is now a module!
 - 22.0831 : Updated Write-Log to be a little more efficient and to provide a ValidateSet on the -Level parameter
 - 22.0824 : Switched to a new versioning scheme. Updated capitalization of PowerShell language keywords because I have a sickness that demands accuracy even where none is required.
