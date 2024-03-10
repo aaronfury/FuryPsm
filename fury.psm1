@@ -4,35 +4,22 @@
 
 [CmdletBinding()]
 param(
-	[Parameter(Mandatory=$false)][string]$InputFile,
-	[Parameter(Mandatory=$false)][string]$OutputFile,
-	[Parameter(Mandatory=$false)][string]$LogFile,
+	[Parameter()][string[]]$NeedsModules, # An array of PS module names to load
+	[Parameter(Mandatory=$false)][string]$OutputFileName,
+	[Parameter(Mandatory=$false)][switch]$OutputOmitSubfolder,
+	[Parameter(Mandatory=$false)][System.Collections.Specialized.OrderedDictionary]$OutputHeaders, # Used to pre-populate the headers in the output file, to make sure they are not constrained to the headers of the first record
+	[Parameter(Mandatory=$false)][string]$LogFileName,
+	[Parameter(Mandatory=$false)][switch]$LogOmitFile,
+	[Parameter(Mandatory=$false)][switch]$LogOmitSubfolder,
 	[Parameter(Mandatory=$false)][switch]$TestRun,
 	[Parameter(Mandatory=$false)][switch]$UseAdminCredential,
 	[Parameter(Mandatory=$false)]$AdminCredential = [System.Management.Automation.PSCredential]::Empty,
 	[Parameter(Mandatory=$false)]$AdminCredentialPassFile,
-	[Parameter(Mandatory=$false)][int]$MinPowerShellVersion = 3,
 	[Parameter(Mandatory=$false)][string]$SettingsFile = 'settings.json',
 	[Parameter(Mandatory=$false)][switch]$SuperDebug
 )
 
 # ======== VARIABLE DEFINITION ========
-
-# Used to pre-populate the headers in the output file, to make sure they are not constrained to the headers of the first record
-$OutputHeaders = @(
-	"Column1",
-	"Column2"
-)
-
-# Set to $true to always use verbose logging, without requiring the script to have the -Verbose parameter
-$DefaultToVerbose = $false
-
-$NeedsModules = @() # An array of PS module names to load
-
-$ScriptGeneratesOutputFile = $true # Whether an output file is generated (the log file is ALWAYS generated)
-
-$ScriptNeedsInputFile = $true # Whether the script requires a file to be specified using the -InputFile parameter
-$ScriptInputFileType = "" # Leave blank for .csv, or specify the extension type (excluding the "."). Use "*" for all files
 $MinPowerShellVersion = 5.0
 
 # ========= END VARIABLE DEFINITION ===========
@@ -40,25 +27,29 @@ $MinPowerShellVersion = 5.0
 # ============= SCRIPT CONSTANTS ==============
 
 $ScriptName = $MyInvocation.MyCommand.Name -replace ".ps1",""
-$ScriptExecutionTime = Get-Date
 $ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
 $TranscriptFileName = "PS Transcript - $ScriptExecutionTimestamp.log"
 
-switch ($null) {
-	$Logfile {
-		if (-not (Test-Path ".\LOG\")) {
-			New-Item -ItemType Directory -Path ".\LOG" | Out-Null
-		}
-		$global:Logfile = ".\LOG\$ScriptName $ScriptExecutionTimestamp.log"
+if (-not $LogOmitFile) {
+	if (-not $LogfileName) {
+		$LogfileName = "$ScriptName $ScriptExecutionTimestamp.log"
 	}
-	$OutputFile {
-		if ($ScriptGeneratesOutputFile) {
-			if (-not (Test-Path ".\OUTPUT\")) {
-				New-Item -ItemType Directory -Path ".\OUTPUT" | Out-Null
-			}
-			$global:OutputFile = ".\OUTPUT\$ScriptName $ScriptExecutionTimestamp.csv"
-		}
+
+	if (-not $LogOmitSubfolder -and -not (Test-Path ".\LOG\")) {
+		[void](New-Item -ItemType Directory -Path ".\LOG")
+		$LogFilePath = ".\LOG\"
 	}
+
+	$global:LogFile = "$LogFilePath$LogFileName"
+}
+
+if ($OutputFileName) {
+	if (-not $OutputOmitSubfolder -and -not (Test-Path ".\OUTPUT\")) {
+		[void](New-Item -ItemType Directory -Path ".\OUTPUT")
+		$OutputFilePath = ".\OUTPUT\"
+	}
+
+	$global:OutputFile = "$OutputFilePath$OutputFileName"
 }
 
 $credSplat = @{} # Credential splat
@@ -94,9 +85,13 @@ function Exit-Script {
 		[void](Stop-Transcript)
 	} catch {}
     
-	if ($global:ErrorsLogged -and $global:Settings["EmailErrorReport"]) {
-		Write-Log "Sending log as email to $($EmailRecipients -join ",")"
-		New-Email -From $global:Settings["ErrorsEmailFromAddress"] -Recipients $global:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $global:Settings["ErrorsEmailSmtpServer"]
+	if ($global:ErrorsLogged) {
+		Write-Log "This script generated errors during execution." -Level WARNING
+
+		if ($global:Settings["EmailErrorReport"]) {
+			Write-Log "Sending log as email to $($EmailRecipients -join ",")"
+			New-Email -From $global:Settings["ErrorsEmailFromAddress"] -Recipients $global:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $global:Settings["ErrorsEmailSmtpServer"]
+		}
 	}
 
     if ($Failed) {
@@ -592,17 +587,6 @@ function Initialize-Module {
 		Write-Log "This script requires Microsoft PowerShell version $MinPowerShellVersion or later to run. Please install the latest version of the Windows Management Framework or the PowerShell standalone component and run this script again. Sowwy." -Fatal
 	}
 
-	# Check for the input file, if one is specified in the script
-	if ($ScriptNeedsInputFile) {
-		if (-not $InputFile) {
-			$iftSplat = @{}
-			if ($ScriptInputFileType) {
-				$iftSplat["CustomFileType"] = $ScriptInputFileType
-			}
-			$global:InputFile = Get-FileName @iftSplat
-		}
-	}
-
 	# Check if the output path already exists; if not, create it
 	if (-not (Test-Path ".\OUTPUT\")) {
 		try {
@@ -910,7 +894,7 @@ function Write-Log {
 		# Set the color for the console output and update counters
 		switch ($Level) {
 			"WARNING" { $Color = "Yellow"; $TotalWarnings++; break }
-			"ERROR" { $Color = "Red"; $ErrorsLogged = $true; $TotalErrors++; break }
+			"ERROR" { $Color = "Red"; $global:ErrorsLogged = $true; $TotalErrors++; break }
 			"VERBOSE" { $Color = "Gray"; break }
 			default { $Color = "White" }
 		}
@@ -918,7 +902,9 @@ function Write-Log {
 		Write-Host $Output -Fore $Color
 	}
 
-	"$Timestamp`t$Output" | Add-Content $LogFile
+	if (-not $LogOmitFile) {
+		"$Timestamp`t$Output" | Add-Content $LogFile
+	}
 
 	if ($Level -eq "ERROR" -and $global:Settings["ErrorThreshold"] -and $global:TotalErrors -gt $global:Settings["ErrorThreshold"]) {
 		"ERROR THRESHOLD EXCEEDED: The script has encountered more than $($global:Settings["ErrorThreshold"]) errors and will now terminate." | Add-Content $LogFile
