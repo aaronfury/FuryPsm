@@ -12,16 +12,15 @@ $SettingsFile = ".\Settings.json"
 
 $ScriptName = (Split-Path -Leaf $MyInvocation.PSCommandPath) -replace ".ps1",""
 $ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
-$TranscriptFileName = "PS Transcript - $ScriptName - $ScriptExecutionTimestamp.log"
-
+$TranscriptFileName = "PS Transcript - $ScriptExecutionTimestamp.log"
 
 $CredSplat = @{} # Credential splat
 $WhatIfSplat = @{}
 $aDWSSplat = @{} # AD Web Services requirement (when finding a DC using certain template functions)
 $eaSplat = @{ ErrorAction = "Stop" } # Error Action splat
 
-$script:Settings = @() # Populated during the Import-Settings function
-$script:Variables = @() # Populated during the Import-Settings function
+$global:Settings = @{} # Populated during the Import-Settings function
+$global:Variables = @{} # Populated during the Import-Settings function
 
 $TotalErrors = $TotalWarnings = 0
 
@@ -50,17 +49,20 @@ function Exit-Script {
 	if ($script:TotalErrors) {
 		Write-Log "This script generated errors during execution." -Level WARNING
 
-		if ($script:Settings["EmailErrorReport"]) {
+		if ($global:Settings["EmailErrorReport"]) {
 			Write-Log "Sending log as email to $($EmailRecipients -join ",")"
-			New-Email -From $script:Settings["ErrorsEmailFromAddress"] -Recipients $script:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $script:Settings["ErrorsEmailSmtpServer"]
+			New-Email -From $global:Settings["ErrorsEmailFromAddress"] -Recipients $global:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $global:Settings["ErrorsEmailSmtpServer"]
 		}
 	}
+	
+	Clear-Variable -Name "Settings","Variables" -Scope Global -Force
+	Remove-Module fury -Force
 
     if ($Failed) {
-        exit -1
+		exit -1
+	} else {
+        exit 0
     }
-
-	exit
 }
 
 function Get-DC {
@@ -473,9 +475,8 @@ function Get-RandomString {
 }
 
 function Import-Settings {
-	param(
-		[Parameter(Mandatory=$false)][ValidateSet("JSON","XML")]$FileFormat = "JSON"
-	)
+
+	$DeferredLoggingEnabled = $false # This is a hack, but the idea is to disable the actual enablement of logging until the settings file has been fully imported, since the settings may specify to use a subfolder, etc. and that will affect naming.
 
 	if ((Test-Path -Path $SettingsFile)) {
 		Write-Log "Settings file $SettingsFile found. Attempting to import settings..." -Level INFO
@@ -484,46 +485,48 @@ function Import-Settings {
 		return 1
 	}
 
-	switch ($FileFormat) {
-		"JSON" {
-			try {
-				# Cleans up the file before converting it to JSON. Specifically, removes all "comments" and then makes sure that any commented-out items don't create dangling commas
-				$SettingsJson =  ((Get-Content -Raw -Path $SettingsFile) -replace "//.*?\n","`n") -replace ",\n}","\n}"
-				$SettingsData = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
-			} catch {
-				Write-Log "Error attempting to import a JSON settings file ($SettingsFile). The specific error is: $_" -Level ERROR
-				return 1
-			}
-		}
-		"XML" {
-			Write-Log "XML settings files are not yet supported. Just use JSON, weirdo."
-		}
+	try {
+		# Cleans up the file before converting it to JSON. Specifically, removes all "comments" and then makes sure that any commented-out items don't create dangling commas
+		$SettingsJson =  ((Get-Content -Raw -Path $SettingsFile) -replace "//.*?\n","`n") -replace ",\n}","\n}"
+		$SettingsData = ConvertFrom-Json -InputObject $SettingsJson -ErrorAction Stop
+	} catch {
+		Write-Log "Error attempting to import a JSON settings file ($SettingsFile). The specific error is: $_" -Level ERROR
+		return 1
 	}
 
 	if ($SettingsData.settings) {
 		Write-Log "Now reading in settings from $SettingsFile"
-		$global:Settings = @{}
+
 		foreach ($setting in ($SettingsData.settings | Get-Member -Name * -MemberType NoteProperty).Name) {
+			if ($setting -eq "LogsEnabled") {
+				$DeferredLoggingEnabled = $SettingsData.settings.$setting
+				continue
+			}
+			
 			try {
 				$global:Settings[$setting] = $SettingsData.settings.$setting
-				Write-Log "Set setting `$Settings[$setting] to $($SettingsData.settings.$setting)" -Level "VERBOSE"
+				Write-Log "Set setting `$global:Settings[$setting] to $($SettingsData.settings.$setting)" -Level "VERBOSE"
 			} catch {
-				Write-Log "Could not configure setting $setting. Check the $SettingsFile file and try again" -Level "ERROR"
+				Write-Log "Could not configure setting $setting. Check the $SettingsFile file and try again. $_" -Level "ERROR"
 			}
 		}
 	}
 
 	if ($SettingsData.variables) {
 		Write-Log "Now reading in variable values from $SettingsFile."
-		$global:Variables = @{}
 		foreach ($variable in ($SettingsData.variables | Get-Member -Name * -MemberType NoteProperty).Name) {
 			try {
 				$global:Variables[$variable] = $SettingsData.variables.$variable
-				Write-Log "Set variable `$Variables[$variable] to $($SettingsData.variables.$variable)" -Level "VERBOSE"
+				Write-Log "Set variable `$global:Variables[$variable] to $($SettingsData.variables.$variable)" -Level "VERBOSE"
 			} catch {
-				Write-Log "Could not set variable $variable. Check the $SettingsFile file and try again" -Level "ERROR"
+				Write-Log "Could not set variable $variable. Check the $SettingsFile file and try again. $_" -Level "ERROR"
 			}
 		}
+	}
+
+	if ($DeferredLoggingEnabled) {
+		Write-Log "Enabling logging as specified in settings file." -HostOnly
+		$global:Settings["LogsEnabled"] = $true
 	}
 }
 
@@ -531,24 +534,24 @@ function Initialize-Module {
 	# Clear the error log
 	$Error.Clear()
 
-	if ($global:TranscriptionEnabled) {
-		Start-Transcript -Path $TranscriptFileName
-		Write-Host "Transcription started. Transcript file is $TranscriptFileName"
-	}
-
 	# Foremost, see if there's a Settings.json file and load it.
 	if (Test-Path $SettingsFile) {
 		Import-Settings
 	} else {
 		Write-Log "No settings file found at $SettingsFile. Using default settings." -Level "INFO"
-		$script:Settings = @{
+		$global:Settings = @{
 			"LogsEnabled" = $true;
 			"LogsInSubdirectory" = $true;
 			"OutputInSubdirectory" = $true
 		}
 	}
 
-	if ($Settings["LogEnabled"]) {
+	if ($global:Settings["TranscriptionEnabled"]) {
+		Start-Transcript -Path $TranscriptFileName
+		Write-Host "Transcription started. Transcript file is $TranscriptFileName"
+	}
+
+	if ($Settings["LogsEnabled"]) {
 	$LogfileName = "$ScriptName $ScriptExecutionTimestamp.log"
 
 	if ($Settings["LogsInSubdirectory"]) {
@@ -574,7 +577,7 @@ if ($Settings["OutputInSubdirectory"]) {
 		Write-Log "This script requires Microsoft PowerShell version $MinPowerShellVersion or later to run. Please install the latest version of the Windows Management Framework or the PowerShell standalone component and run this script again. Sowwy." -Fatal
 	}
 
-	foreach ($module in $script:Settings["RequiredModules"]) {
+	foreach ($module in $global:Settings["RequiredModules"]) {
 		if (-not (Get-Module $module)) {
 			try {
 				Import-Module $module -ErrorAction Stop
@@ -586,16 +589,16 @@ if ($Settings["OutputInSubdirectory"]) {
 	}
 
 	# Check if alternate admin credentials are to be used
-	if ($script:Settings["UseAdminCredential"]) {
-		if ($script:Settings["AdminCredentialPassFile"]) {
+	if ($global:Settings["UseAdminCredential"]) {
+		if ($global:Settings["AdminCredentialPassFile"]) {
 			try {
-				$AdminPass = Get-Content $script:Settings["AdminCredentialPassFile"] | ConvertTo-SecureString -ErrorAction Stop
+				$AdminPass = Get-Content $global:Settings["AdminCredentialPassFile"] | ConvertTo-SecureString -ErrorAction Stop
 			} catch [PSArgumentException] {
-				Write-Log "The specified admin credential password file ($script:Settings['AdminCredentialPassFile']) does not contain a valid secure string. If you are using a password file, it must contain a secure string generated by ConvertTo-SecureString *on the same machine as this script*. For example: 'ConvertTo-SecureString -AsPlainText -Force -String `"YourPassword`" | Out-File AdminPassword.txt'" -Level "ERROR" -Fatal
+				Write-Log "The specified admin credential password file ($global:Settings['AdminCredentialPassFile']) does not contain a valid secure string. If you are using a password file, it must contain a secure string generated by ConvertTo-SecureString *on the same machine as this script*. For example: 'ConvertTo-SecureString -AsPlainText -Force -String `"YourPassword`" | Out-File AdminPassword.txt'" -Level "ERROR" -Fatal
 			}
 
 			try {
-				$AdminCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $script:Settings["AdminUsername"],$AdminPass
+				$AdminCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $global:Settings["AdminUsername"],$AdminPass
 			} catch {
 				Write-Log "Could not create a PSCredential object from the specified username and password file. The specific error is: $_" -Level "ERROR" -Fatal
 			}
@@ -608,7 +611,7 @@ if ($Settings["OutputInSubdirectory"]) {
 	}
 
 	# Check whether to set the -Whatif parameter on cmdlets that support it (custom functions should use the $Settings["DryRun"] variable directly to determine whether to make changes)
-	if ($script:Settings["DryRun"]) {
+	if ($global:Settings["DryRun"]) {
 		$WhatIfSplat["Whatif"] = $true
 	}
 
@@ -640,7 +643,7 @@ function New-Email {
 		[string]$CustomFullBody,
 		[string]$SmtpServer,
 		[switch]$AttachLogFile,
-		[switch]$AttachOutputFile,
+		[array]$AdditionalAttachments,
 		$Attachments
 	)
 
@@ -676,7 +679,7 @@ function New-Email {
 
 	switch ($true) {
 		$AttachLogFile { $Attachments += ,(Get-Item -Path $LogFile).FullName }
-		$AttachOutputFile { $Attachments += ,(Get-Item -Path $OutputFile).FullName }
+		$AdditionalAttachments.Count { if ($AdditionalAttachments[0] -is [string]) { $Attachments += $AdditionalAttachments } else { $Attachments += $AdditionalAttachments.FullName } }
 	}
 	if ($Attachments) { $MessageParams.Add("Attachments", $Attachments) }
 
@@ -825,6 +828,7 @@ function Write-Log {
 		[Parameter()]$Message,
 		[Parameter()][ValidateSet("INFO","WARNING","ERROR","VERBOSE")][string]$Level = "INFO",
 		[Parameter()][switch]$Silent,
+		[Parameter()][switch]$HostOnly,
 		[Parameter()][switch]$Fatal,
 		[Parameter()][switch]$Separator
 	)
@@ -860,18 +864,18 @@ function Write-Log {
 		Write-Host $Output -Fore $Color
 	}
 
-	if ($Settings["LogsEnabled"]) {
-		"$Timestamp`t$Output" | Add-Content $LogFile
+	if ($global:Settings["LogsEnabled"] -and -not $HostOnly) {
+		"$Timestamp`t$Output" | Add-Content $script:LogFile
 	}
 
 	if ($Level -eq "ERROR" -and $global:Settings["ErrorThreshold"] -and $global:TotalErrors -gt $global:Settings["ErrorThreshold"]) {
-		"ERROR THRESHOLD EXCEEDED: The script has encountered more than $($global:Settings["ErrorThreshold"]) errors and will now terminate." | Add-Content $LogFile
+		"ERROR THRESHOLD EXCEEDED: The script has encountered more than $($global:Settings["ErrorThreshold"]) errors and will now terminate." | Add-Content $script:LogFile
 		Exit-Script -Failed
 	}
 
 	if ($Fatal) {
-		"FATAL: The previous error was fatal. The script will now exit." | Add-Content $LogFile
-		Write-Host "FATAL: The previous error was fatal. The script will now poop the bed." -Fore Red
+		"FATAL: The previous error was fatal. The script will now exit." | Add-Content $script:LogFile
+		Write-Host "FATAL: The previous error was fatal. The script will now exit." -Fore Red
 		Exit-Script -Failed
 	}
 }
