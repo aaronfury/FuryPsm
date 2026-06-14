@@ -1,26 +1,10 @@
 ﻿<#
-	FURYSCRIPT PowerShell Module v23.0306
+	FURYSCRIPT PowerShell Module v25.0614
 #>
-
-[CmdletBinding()]
-param(
-	[Parameter()][string[]]$NeedsModules, # An array of PS module names to load
-	[Parameter(Mandatory=$false)][string]$OutputFileName,
-	[Parameter(Mandatory=$false)][switch]$OutputOmitSubfolder,
-	[Parameter(Mandatory=$false)][System.Collections.Specialized.OrderedDictionary]$OutputHeaders, # Used to pre-populate the headers in the output file, to make sure they are not constrained to the headers of the first record
-	[Parameter(Mandatory=$false)][string]$LogFileName,
-	[Parameter(Mandatory=$false)][switch]$LogOmitFile,
-	[Parameter(Mandatory=$false)][switch]$LogOmitSubfolder,
-	[Parameter(Mandatory=$false)][switch]$TestRun,
-	[Parameter(Mandatory=$false)][switch]$UseAdminCredential,
-	[Parameter(Mandatory=$false)]$AdminCredential = [System.Management.Automation.PSCredential]::Empty,
-	[Parameter(Mandatory=$false)]$AdminCredentialPassFile,
-	[Parameter(Mandatory=$false)][string]$SettingsFile = 'settings.json',
-	[Parameter(Mandatory=$false)][switch]$SuperDebug
-)
 
 # ======== VARIABLE DEFINITION ========
 $MinPowerShellVersion = 5.0
+$SettingsFile = ".\Settings.json"
 
 # ========= END VARIABLE DEFINITION ===========
 
@@ -30,38 +14,16 @@ $ScriptName = $MyInvocation.MyCommand.Name -replace ".ps1",""
 $ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
 $TranscriptFileName = "PS Transcript - $ScriptExecutionTimestamp.log"
 
-if (-not $LogOmitFile) {
-	if (-not $LogfileName) {
-		$LogfileName = "$ScriptName $ScriptExecutionTimestamp.log"
-	}
 
-	if (-not $LogOmitSubfolder -and -not (Test-Path ".\LOG\")) {
-		[void](New-Item -ItemType Directory -Path ".\LOG")
-		$LogFilePath = ".\LOG\"
-	}
-
-	$global:LogFile = "$LogFilePath$LogFileName"
-}
-
-if ($OutputFileName) {
-	if (-not $OutputOmitSubfolder -and -not (Test-Path ".\OUTPUT\")) {
-		[void](New-Item -ItemType Directory -Path ".\OUTPUT")
-		$OutputFilePath = ".\OUTPUT\"
-	}
-
-	$global:OutputFile = "$OutputFilePath$OutputFileName"
-}
-
-$credSplat = @{} # Credential splat
+$CredSplat = @{} # Credential splat
+$WhatIfSplat = @{}
 $aDWSSplat = @{} # AD Web Services requirement (when finding a DC using certain template functions)
 $eaSplat = @{ ErrorAction = "Stop" } # Error Action splat
-$testSplat = @{}
 
-$global:Settings = @() # Populated during the Import-Settings function
-$global:Variables = @() # Populated during the Import-Settings function
+$script:Settings = @() # Populated during the Import-Settings function
+$script:Variables = @() # Populated during the Import-Settings function
 
 $TotalErrors = $TotalWarnings = 0
-$ErrorsLogged = $false
 
 # ========== END SCRIPT CONSTANTS =============
 
@@ -85,12 +47,12 @@ function Exit-Script {
 		[void](Stop-Transcript)
 	} catch {}
     
-	if ($global:ErrorsLogged) {
+	if ($script:TotalErrors) {
 		Write-Log "This script generated errors during execution." -Level WARNING
 
-		if ($global:Settings["EmailErrorReport"]) {
+		if ($script:Settings["EmailErrorReport"]) {
 			Write-Log "Sending log as email to $($EmailRecipients -join ",")"
-			New-Email -From $global:Settings["ErrorsEmailFromAddress"] -Recipients $global:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $global:Settings["ErrorsEmailSmtpServer"]
+			New-Email -From $script:Settings["ErrorsEmailFromAddress"] -Recipients $script:Settings["ErrorsEmailRecipients"] -AttachLogFile -SmtpServer $script:Settings["ErrorsEmailSmtpServer"]
 		}
 	}
 
@@ -338,9 +300,9 @@ function Get-Events {
 
 	foreach ($computer in $Computers) {
 		try {
-			$Events = Get-WinEvent -ComputerName $computer -FilterHashtable $FilterHash @credSplat -ErrorAction SilentlyContinue -Verbose:$false | Select-Object MachineName,Id,Message,ProviderName
-			foreach ($event in $Events) {
-				Write-Data -Record $event -Output "EventLogs - $EventID.csv"
+			$Events = Get-WinEvent -ComputerName $computer -FilterHashtable $FilterHash @CredSplat -ErrorAction SilentlyContinue -Verbose:$false | Select-Object MachineName,Id,Message,ProviderName
+			foreach ($eventLog in $Events) {
+				Write-Data -Record $eventLog -Output "EventLogs - $EventID.csv"
 			}
 		} catch {
 			Write-Log "Could not parse the event logs on $computer." -Level "ERROR"
@@ -515,8 +477,10 @@ function Import-Settings {
 		[Parameter(Mandatory=$false)][ValidateSet("JSON","XML")]$FileFormat = "JSON"
 	)
 
-	if (-not (Test-Path -Path $SettingsFile)) {
-		Write-Log "Settings file $SettingsFile not found. Specify a file path using the -SettingsFile argument" -Level ERROR
+	if ((Test-Path -Path $SettingsFile)) {
+		Write-Log "Settings file $SettingsFile found. Attempting to import settings..." -Level INFO
+	} else {
+		Write-Log "Settings file $SettingsFile not found. Specify a file path using the -SettingsFile argument" -Level INFO
 		return 1
 	}
 
@@ -542,7 +506,7 @@ function Import-Settings {
 		foreach ($setting in ($SettingsData.settings | Get-Member -Name * -MemberType NoteProperty).Name) {
 			try {
 				$global:Settings[$setting] = $SettingsData.settings.$setting
-				Write-Log "Set setting `$Settings[$setting] to $(Get-Variable $setting -ValueOnly)" -Level "VERBOSE"
+				Write-Log "Set setting `$Settings[$setting] to $($SettingsData.settings.$setting)" -Level "VERBOSE"
 			} catch {
 				Write-Log "Could not configure setting $setting. Check the $SettingsFile file and try again" -Level "ERROR"
 			}
@@ -555,7 +519,7 @@ function Import-Settings {
 		foreach ($variable in ($SettingsData.variables | Get-Member -Name * -MemberType NoteProperty).Name) {
 			try {
 				$global:Variables[$variable] = $SettingsData.variables.$variable
-				Write-Log "Set variable `$Variables[$variable] to $(Get-Variable $variable -ValueOnly)" -Level "VERBOSE"
+				Write-Log "Set variable `$Variables[$variable] to $($SettingsData.variables.$variable)" -Level "VERBOSE"
 			} catch {
 				Write-Log "Could not set variable $variable. Check the $SettingsFile file and try again" -Level "ERROR"
 			}
@@ -567,19 +531,42 @@ function Initialize-Module {
 	# Clear the error log
 	$Error.Clear()
 
-	if ($SuperDebug) {
+	if ($global:TranscriptionEnabled) {
 		Start-Transcript -Path $TranscriptFileName
+		Write-Host "Transcription started. Transcript file is $TranscriptFileName"
 	}
 
 	# Foremost, see if there's a Settings.json file and load it.
 	if (Test-Path $SettingsFile) {
 		Import-Settings
+	} else {
+		Write-Log "No settings file found at $SettingsFile. Using default settings." -Level "INFO"
+		$script:Settings = @{
+			"LogsEnabled" = $true;
+			"LogsInSubdirectory" = $true;
+			"OutputInSubdirectory" = $true
+		}
 	}
 
-	# Check if the log file already exists; if not, create it
-	if (-not (Test-Path $LogFile)) {
-		New-Item -Path $LogFile -ItemType File -Force | Out-Null
+	if ($Settings["LogEnabled"]) {
+	$LogfileName = "$ScriptName $ScriptExecutionTimestamp.log"
+
+	if ($Settings["LogsInSubdirectory"]) {
+		if (-not (Test-Path ".\LOG\")) {
+			[void](New-Item -ItemType Directory -Path ".\LOG")
+		}
+		$LogFilePath = ".\LOG\"
 	}
+
+	$script:LogFile = "$LogFilePath$LogFileName"
+}
+
+if ($Settings["OutputInSubdirectory"]) {
+	if (-not (Test-Path ".\OUTPUT\")) {
+		[void](New-Item -ItemType Directory -Path ".\OUTPUT")
+	}
+	$script:OutputFilePath = ".\OUTPUT\"
+}
 
 	Write-Log "Initializing $ScriptName..."
 
@@ -600,21 +587,7 @@ function Initialize-Module {
 		}
 	}
 
-	# Check if the output file already exists; if so, prompt to overwrite.
-	if ($ScriptGeneratesOutputFile) {
-		if (Test-Path $OutputFile) {
-			if ((Read-Host "Specified output file $OutputFile exists. Overwrite? [Y/N]") -ne "Y") {
-				Write-Log "Specified output file exists" -Level "ERROR" -Fatal
-			} else {
-				Write-Log "Overwriting output file '$OutputFile'"
-			}
-		}
-		New-Item -Path $OutputFile -ItemType File | Out-Null
-		"`"" + $($OutputHeaders -join "`",`"") + "`"" | Out-File $OutputFile -Encoding UTF8 # Pre-populate the headers in the output file, to make sure they are not constrained to the headers of the first record
-	}
-
-
-	foreach ($module in $NeedsModules) {
+	foreach ($module in $script:Settings["RequiredModules"]) {
 		if (-not (Get-Module $module)) {
 			try {
 				Import-Module $module -ErrorAction Stop
@@ -626,32 +599,30 @@ function Initialize-Module {
 	}
 
 	# Check if alternate admin credentials are to be used
-	if ($UseAdminCredential) {
-		switch ($true) {
-			($AdminCredentialPassFile) {
-				$AdminPass = Get-Content $AdminCredentialPassFile | ConvertTo-SecureString
+	if ($script:Settings["UseAdminCredential"]) {
+		if ($script:Settings["AdminCredentialPassFile"]) {
+			try {
+				$AdminPass = Get-Content $script:Settings["AdminCredentialPassFile"] | ConvertTo-SecureString -ErrorAction Stop
+			} catch [PSArgumentException] {
+				Write-Log "The specified admin credential password file ($script:Settings['AdminCredentialPassFile']) does not contain a valid secure string. If you are using a password file, it must contain a secure string generated by ConvertTo-SecureString *on the same machine as this script*. For example: 'ConvertTo-SecureString -AsPlainText -Force -String `"YourPassword`" | Out-File AdminPassword.txt'" -Level "ERROR" -Fatal
 			}
-			($AdminCredential -isnot [System.Management.Automation.PSCredential]) {
-				Write-Log "if using the -AdminCredential parameter, please pass a PSCredential object. Or omit the -AdminCredential parameter to be prompted for credentials" -Level "ERROR" -Fatal
-				break
+
+			try {
+				$AdminCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $script:Settings["AdminUsername"],$AdminPass
+			} catch {
+				Write-Log "Could not create a PSCredential object from the specified username and password file. The specific error is: $_" -Level "ERROR" -Fatal
 			}
-			($AdminCredential -eq [System.Management.Automation.PSCredential]::Empty) {
-				if ($AdminPass) {
-					$AdminUsername = Read-Host "Password read from $AdminCredentialPassFile. Please specify the username to use"
-					$AdminCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $AdminUsername,$AdminPass
-				} else {
-					$AdminCredential = Get-Credential -Message "Please specify an administrator account to use"
-				}
-				Write-Log "Admin credentials loaded for $($AdminCredential.UserName)" -Level "VERBOSE"
-			}
+		} else {
+			Write-Host "Please provide admin credentials to use for the script." -ForegroundColor Yellow
+			$AdminCredential = Get-Credential -Message "Please specify an administrator account to use"
 		}
 
-		$global:credSplat['Credential'] = $AdminCredential
+		$global:CredSplat['Credential'] = $AdminCredential
 	}
 
-	# Check whether to set the -Whatif parameter on cmdlets that support it (custom functions should use the $TestRun variable directly to determine whether to make changes)
-	if ($TestRun) {
-		$testSplat["Whatif"] = $true
+	# Check whether to set the -Whatif parameter on cmdlets that support it (custom functions should use the $Settings["DryRun"] variable directly to determine whether to make changes)
+	if ($script:Settings["DryRun"]) {
+		$WhatIfSplat["Whatif"] = $true
 	}
 
 	# Get current user. You know, for accountability
@@ -724,7 +695,7 @@ function New-Email {
 
 	try {
 		Write-Log "Emailing report to $($Recipients -join ",")..."
-		Send-MailMessage @MessageParams @credSplat
+		Send-MailMessage @MessageParams @CredSplat
 	} catch {
 		Write-Log "Could not send report email. Check the parameters for the next iteration of the script." -Level "ERROR"
 		Write-Log "Line $($_.InvocationInfo.ScriptLineNumber) - $_" -Level "ERROR"
@@ -825,19 +796,19 @@ function Wait-Input {
 function Write-Data {
 	[CmdletBinding()]param(
 		[Parameter(Mandatory=$true,Position=1,ValueFromPipeline=$true)]$Record,
-		[Parameter(Mandatory=$false, Position=2)][ValidateSet("csv","text","json")]$WriteType = "csv",
-		[Parameter(Mandatory=$false, Position=2)]$Output = $OutputFile,
-		[Parameter(Mandatory=$false, Position=3)][bool]$Force = $false
+		[Parameter(Mandatory=$true, Position=2)]$OutputFile,
+		[Parameter(Mandatory=$false, Position=3)][ValidateSet("csv","text","json")]$WriteType = "csv",
+		[Parameter(Mandatory=$false, Position=4)][bool]$Force = $false
 	)
 
 	if ($Record -is [hashtable]) {
 		$Record = [pscustomobject]$Record
 	}
 
-	if (-not (Test-Path $Output)) {
-		Write-Log "Output file $Output did not exist. Creating..." -Level "VERBOSE"
-		if ($Output -like "*\*") {
-			$ParentPath = Split-Path $Output
+	if (-not (Test-Path $OutputFile)) {
+		Write-Log "Output file $OutputFile did not exist. Creating..." -Level "VERBOSE"
+		if ($OutputFile -like "*\*") {
+			$ParentPath = Split-Path $OutputFile
 			if (-not (Test-Path "$ParentPath\")) {
 				try {
 					New-Item -ItemType Directory -Path $ParentPath -Force | Out-Null
@@ -851,13 +822,13 @@ function Write-Data {
 
 	switch ($WriteType) {
 		"csv" {
-			$Record | Export-Csv -Append -Path $Output -NoTypeInformation -Force -Encoding ASCII
+			$Record | Export-Csv -Append -Path $OutputFile -NoTypeInformation -Force -Encoding ASCII
 		}
 		"text" {
-			$Record | Out-File -FilePath $Output -Append -Encoding ASCII
+			$Record | Out-File -FilePath $OutputFile -Append -Encoding ASCII
 		}
 		"json" {
-			ConvertTo-Json $Record | Out-File -FilePath $Output -Append -Encoding utf8
+			ConvertTo-Json $Record | Out-File -FilePath $OutputFile -Append -Encoding utf8
 		}
 	}
 }
@@ -894,7 +865,7 @@ function Write-Log {
 		# Set the color for the console output and update counters
 		switch ($Level) {
 			"WARNING" { $Color = "Yellow"; $TotalWarnings++; break }
-			"ERROR" { $Color = "Red"; $global:ErrorsLogged = $true; $TotalErrors++; break }
+			"ERROR" { $Color = "Red"; $TotalErrors++; break }
 			"VERBOSE" { $Color = "Gray"; break }
 			default { $Color = "White" }
 		}
@@ -902,7 +873,7 @@ function Write-Log {
 		Write-Host $Output -Fore $Color
 	}
 
-	if (-not $LogOmitFile) {
+	if ($Settings["LogsEnabled"]) {
 		"$Timestamp`t$Output" | Add-Content $LogFile
 	}
 
