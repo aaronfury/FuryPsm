@@ -10,9 +10,9 @@ $SettingsFile = ".\Settings.json"
 
 # ============= SCRIPT CONSTANTS ==============
 
-$ScriptName = $MyInvocation.MyCommand.Name -replace ".ps1",""
+$ScriptName = (Split-Path -Leaf $MyInvocation.PSCommandPath) -replace ".ps1",""
 $ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
-$TranscriptFileName = "PS Transcript - $ScriptExecutionTimestamp.log"
+$TranscriptFileName = "PS Transcript - $ScriptName - $ScriptExecutionTimestamp.log"
 
 
 $CredSplat = @{} # Credential splat
@@ -572,19 +572,6 @@ if ($Settings["OutputInSubdirectory"]) {
 
 	if ($MinPowerShellVersion -and $PSVersionTable.PSVersion.ToString() -lt $MinPowerShellVersion) {
 		Write-Log "This script requires Microsoft PowerShell version $MinPowerShellVersion or later to run. Please install the latest version of the Windows Management Framework or the PowerShell standalone component and run this script again. Sowwy." -Fatal
-	}
-
-	# Check if the output path already exists; if not, create it
-	if (-not (Test-Path ".\OUTPUT\")) {
-		try {
-			Write-Host "Creating log file..."
-			New-Item -Path $LogFile -ItemType file | Out-Null
-		} catch {
-			Write-Host "Failed to create the log file. The specific error is:"
-			$_
-			Read-Host "Press a key to exit"
-			exit
-		}
 	}
 
 	foreach ($module in $script:Settings["RequiredModules"]) {
