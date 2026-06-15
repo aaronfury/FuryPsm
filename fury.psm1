@@ -552,24 +552,17 @@ function Initialize-Module {
 	}
 
 	if ($Settings["LogsEnabled"]) {
-	$LogfileName = "$ScriptName $ScriptExecutionTimestamp.log"
+		$LogfileName = "$ScriptName $ScriptExecutionTimestamp.log"
 
-	if ($Settings["LogsInSubdirectory"]) {
-		if (-not (Test-Path ".\LOG\")) {
-			[void](New-Item -ItemType Directory -Path ".\LOG")
+		if ($Settings["LogsInSubdirectory"]) {
+			if (-not (Test-Path ".\LOG\")) {
+				[void](New-Item -ItemType Directory -Path ".\LOG")
+			}
+			$LogFilePath = ".\LOG\"
 		}
-		$LogFilePath = ".\LOG\"
-	}
 
-	$script:LogFile = "$LogFilePath$LogFileName"
-}
-
-if ($Settings["OutputInSubdirectory"]) {
-	if (-not (Test-Path ".\OUTPUT\")) {
-		[void](New-Item -ItemType Directory -Path ".\OUTPUT")
+		$script:LogFile = "$LogFilePath$LogFileName"
 	}
-	$script:OutputFilePath = ".\OUTPUT\"
-}
 
 	Write-Log "Initializing $ScriptName..."
 
@@ -793,6 +786,10 @@ function Write-Data {
 
 	if ($Record -is [hashtable]) {
 		$Record = [pscustomobject]$Record
+	}
+	
+	if ($Settings["OutputInSubdirectory"]) {
+		$OutputFile = ".\OUTPUT\$OutputFile"
 	}
 
 	if (-not (Test-Path $OutputFile)) {
