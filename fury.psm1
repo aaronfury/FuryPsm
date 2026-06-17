@@ -1,5 +1,5 @@
 ﻿<#
-	FURYSCRIPT PowerShell Module v25.0614
+	FURYSCRIPT PowerShell Module v25.0616
 #>
 
 # ======== VARIABLE DEFINITION ========
@@ -10,19 +10,23 @@ $SettingsFile = ".\Settings.json"
 
 # ============= SCRIPT CONSTANTS ==============
 
-$ScriptName = (Split-Path -Leaf $MyInvocation.PSCommandPath) -replace ".ps1",""
-$ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
+$ScriptName = $(if ($MyInvocation.PSCommandPath) { (Split-Path -Leaf $MyInvocation.PSCommandPath) -replace ".ps1","" } else { "Unscripted" })
+$global:ScriptExecutionTimestamp = Get-Date -Format "yyyy-MM-dd HH-mm-ss"
 $TranscriptFileName = "PS Transcript - $ScriptExecutionTimestamp.log"
 
-$CredSplat = @{} # Credential splat
-$WhatIfSplat = @{}
-$aDWSSplat = @{} # AD Web Services requirement (when finding a DC using certain template functions)
-$eaSplat = @{ ErrorAction = "Stop" } # Error Action splat
+$global:CredSplat = @{} # Credential splat
+$global:WhatIfSplat = @{}
+$global:aDWSSplat = @{} # AD Web Services requirement (when finding a DC using certain template functions)
+$global:EaSplat = @{ ErrorAction = "Stop" } # Error Action splat
 
 $global:Settings = @{} # Populated during the Import-Settings function
 $global:Variables = @{} # Populated during the Import-Settings function
 
+$global:AllDCs = @() # Used as a cache for Get-AllDCs
+
 $TotalErrors = $TotalWarnings = 0
+
+$TextCulture = (Get-Culture).TextInfo # Used for camel case conversion
 
 # ========== END SCRIPT CONSTANTS =============
 
@@ -91,8 +95,21 @@ function Get-AllDCs {
 		$ADSites,
 		[switch]$ForestWide,
 		[switch]$DCNamesOnly,
+		[switch]$UseCachedData,
 		[switch]$DirectReturn
 	)
+
+	if ($UseCachedData -and $global:AllDCs.Count) {
+		if ($DirectReturn){
+			foreach ($Domain in $Scope.Keys){
+				$global:AllDCs += $Scope.$Domain
+			}
+
+			$global:Scope = $Null
+
+			return $global:AllDCs
+		}
+	} else { $global:AllDCs = $null }
 
 	if (-not $global:Scope) {
 		$global:Scope = @{}
@@ -144,12 +161,12 @@ function Get-AllDCs {
 
 	if ($DirectReturn){
 		foreach ($Domain in $Scope.Keys){
-			$DCs += $Scope.$Domain
+			$global:AllDCs += $Scope.$Domain
 		}
 
 		$global:Scope = $Null
 
-		return $DCs
+		return $global:AllDCs
 	}
 }
 
@@ -261,9 +278,9 @@ function Get-Confirmation {
 function Get-CurrentDirectory {
 	$Invocation = (Get-Variable MyInvocation -Scope 1).Value;
 
-	if($Invocation.PSScriptRoot) {
+	if ($Invocation.PSScriptRoot) {
 		$Invocation.PSScriptRoot;
-	} elseif($Invocation.MyCommand.Path) {
+	} elseif ($Invocation.MyCommand.Path) {
 		Split-Path $Invocation.MyCommand.Path
 	} else {
 		$Invocation.InvocationName.Substring(0,$Invocation.InvocationName.LastIndexOf("\"));
@@ -302,7 +319,7 @@ function Get-Events {
 
 	foreach ($computer in $Computers) {
 		try {
-			$Events = Get-WinEvent -ComputerName $computer -FilterHashtable $FilterHash @CredSplat -ErrorAction SilentlyContinue -Verbose:$false | Select-Object MachineName,Id,Message,ProviderName
+			$Events = Get-WinEvent -ComputerName $computer -FilterHashtable $FilterHash @global:CredSplat -ErrorAction SilentlyContinue -Verbose:$false | Select-Object MachineName,Id,Message,ProviderName
 			foreach ($eventLog in $Events) {
 				Write-Data -Record $eventLog -Output "EventLogs - $EventID.csv"
 			}
@@ -600,6 +617,7 @@ function Initialize-Module {
 			$AdminCredential = Get-Credential -Message "Please specify an administrator account to use"
 		}
 
+		Write-Log "Using admin credential $($AdminCredential.UserName) as specified in the Settings file"
 		$global:CredSplat['Credential'] = $AdminCredential
 	}
 
@@ -731,26 +749,57 @@ function Set-OutputLevel {
 	}
 }
 
+function Split-CamelCaseString {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)][string]$String,
+		[Parameter()][switch]$ReturnArray,
+		[Parameter()][switch]$CapitalizeEachWord
+    )
+
+    process {
+        # Split pattern breaks down into 4 conditions:
+        # 1. Lowercase followed by Uppercase: (?<=[a-z])(?=[A-Z])
+        # 2. Letter followed by a Number: (?<=[a-zA-Z])(?=[0-9])
+        # 3. Number followed by a Letter: (?<=[0-9])(?=[a-zA-Z])
+        # 4. An acronym's last uppercase letter followed by lowercase: (?<=[A-Z])(?=[A-Z][a-z])
+        $pattern = '(?<=[a-z])(?=[A-Z])|(?<=[a-zA-Z])(?=[0-9])|(?<=[0-9])(?=[a-zA-Z])|(?<=[A-Z])(?=[A-Z][a-z])'
+        
+        # Split using the case-sensitive split operator
+        $words = $String -csplit $pattern | Where-Object { $_ -ne '' }
+        
+		if ($CapitalizeEachWord) {
+			$words = $words | foreach {$TextCulture.ToTitleCase($_)}
+		}
+
+		if ($ReturnArray) {
+        	return $words
+		} else {
+			return $words -join " "
+		}
+    }
+}
+
 function Start-ConfirmationTimer {
 	param(
 		[string]$Message,
-		[int]$secondsToWait = 10,
+		[int]$SecondsToWait = 10,
 		[Switch]$OnlyShowDots
 	)
 
 	Write-Host -NoNewline "$Message"
 
-	while ($secondsToWait -ge 0) {
+	while ($SecondsToWait -ge 0) {
 		if (-not [console]::KeyAvailable) {
 			if ($OnlyShowDots) {
 				Write-Host -NoNewLine "."
 			} else {
-				Write-Host -NoNewline " $secondsToWait..."
+				Write-Host -NoNewline " $SecondsToWait..."
 			}
 
 			Start-Sleep -Seconds 1
 
-			$secondsToWait--
+			$SecondsToWait--
 		} else {
 			return $false
 		}
@@ -784,38 +833,38 @@ function Write-Data {
 		[Parameter(Mandatory=$false, Position=4)][bool]$Force = $false
 	)
 
-	if ($Record -is [hashtable]) {
-		$Record = [pscustomobject]$Record
-	}
-	
-	if ($Settings["OutputInSubdirectory"]) {
-		$OutputFile = ".\OUTPUT\$OutputFile"
-	}
+	begin {		
+		if ($Settings["OutputInSubdirectory"]) {
+			$OutputFile = ".\OUTPUT\$OutputFile"
+		}
 
-	if (-not (Test-Path $OutputFile)) {
-		Write-Log "Output file $OutputFile did not exist. Creating..." -Level "VERBOSE"
-		if ($OutputFile -like "*\*") {
-			$ParentPath = Split-Path $OutputFile
-			if (-not (Test-Path "$ParentPath\")) {
-				try {
-					New-Item -ItemType Directory -Path $ParentPath -Force | Out-Null
-				} catch {
-					Write-Log $_
-					Write-Log "Could not create parent path for output file" -Level "ERROR" -Fatal
+		if (-not (Test-Path $OutputFile)) {
+			Write-Log "Output file $OutputFile did not exist. Creating..." -Level "VERBOSE"
+			if ($OutputFile -like "*\*") {
+				$ParentPath = Split-Path $OutputFile
+				if (-not (Test-Path "$ParentPath\")) {
+					try {
+						New-Item -ItemType Directory -Path $ParentPath -Force | Out-Null
+					} catch {
+						Write-Log $_
+						Write-Log "Could not create parent path for output file" -Level "ERROR" -Fatal
+					}
 				}
 			}
 		}
 	}
 
-	switch ($WriteType) {
-		"csv" {
-			$Record | Export-Csv -Append -Path $OutputFile -NoTypeInformation -Force -Encoding ASCII
-		}
-		"text" {
-			$Record | Out-File -FilePath $OutputFile -Append -Encoding ASCII
-		}
-		"json" {
-			ConvertTo-Json $Record | Out-File -FilePath $OutputFile -Append -Encoding utf8
+	process {
+		switch ($WriteType) {
+			"csv" {
+				[pscustomobject]$Record | Export-Csv -Append -Path $OutputFile -NoTypeInformation -Force -Encoding ASCII
+			}
+			"text" {
+				[pscustomobject]$Record | Out-File -FilePath $OutputFile -Append -Encoding ASCII
+			}
+			"json" {
+				ConvertTo-Json $Record -Depth 10 | Out-File -FilePath $OutputFile -Append -Encoding utf8
+			}
 		}
 	}
 }

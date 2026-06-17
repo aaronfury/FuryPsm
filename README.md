@@ -2,6 +2,7 @@
 A PowerShell Module with useful functions
 
 # Changelog
+- 26.0616 : Fixed the Write-Data module to correctly process arrays of data. Did some other stuff too idk.
 - 26.0614 : It still lives! Converted all arguments to settings, cleaned up functions, and got this generally closer to working as a module.
 - 24.0309 : It lives! Cleaned up some irrelevant code, added more parameters for handling log and output files.
 - 23.0529 : Reintroduced settings file support. This whole thing still needs a lot of work to be a module. For now, consider it a code reference...
