@@ -1,5 +1,5 @@
 ﻿<#
-	FURYSCRIPT PowerShell Module v25.0616
+	FURYSCRIPT PowerShell Module v25.0614
 #>
 
 # ======== VARIABLE DEFINITION ========
