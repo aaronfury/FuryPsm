@@ -1,5 +1,5 @@
 ﻿<#
-	FURYSCRIPT PowerShell Module v25.0614
+	FURYSCRIPT PowerShell Module v25.0618
 #>
 
 # ======== VARIABLE DEFINITION ========
@@ -39,6 +39,68 @@ function Convert-FileTime {
 	return [DateTime]::FromFileTime($Time)
 }
 
+function ConvertFrom-ADSIValue {
+	<#
+		Converts a raw DirectorySearcher ResultPropertyValueCollection into friendly PowerShell values:
+		objectSid/objectGUID byte arrays become their canonical string forms, Integer8/FileTime date
+		attributes become [DateTime] (or $null for "never" sentinels), and other binary blobs become
+		Base64. Returns a scalar for single-valued attributes, an array for multi-valued ones, and
+		$null when the attribute is absent.
+	#>
+	param(
+		[string]$Name,
+		$Values
+	)
+
+	# Integer8 attributes stored as Windows FILETIME ticks (100ns since 1601-01-01 UTC).
+	$dateAttributes = @("pwdlastset","lastlogon","lastlogontimestamp","accountexpires","badpasswordtime","lastlogoff","lockouttime")
+	$lowerName = $Name.ToLower()
+
+	$converted = foreach ($value in $Values) {
+		switch ($true) {
+			($value -is [byte[]]) {
+				switch ($lowerName) {
+					"objectsid"  {
+						(New-Object System.Security.Principal.SecurityIdentifier($value, 0)).Value
+						break
+					}
+					"objectguid" {
+						(New-Object System.Guid(,$value)).ToString()
+						break
+					}
+					default {
+						[System.Convert]::ToBase64String($value)
+					}
+				}
+			}
+			($lowerName -in $dateAttributes -and $value -is [Int64]) {
+				# 0 = never set; 0x7FFFFFFFFFFFFFFF (Int64.MaxValue) = "never expires".
+				if ($value -le 0 -or $value -eq [Int64]::MaxValue) {
+					$null
+				} else {
+					[DateTime]::FromFileTimeUtc($value)
+				}
+				break
+			}
+			default {
+				# Note: userAccountControl and msDS-User-Account-Control-Computed are returned as their
+				# raw integers. Decode their individual flags (Enabled, PasswordNeverExpires, LockedOut,
+				# etc.) at projection time so a single attribute can drive multiple friendly columns.
+				$value
+			}
+		}
+	}
+
+	$converted = @($converted)
+	if ($converted.Count -eq 0) {
+		return $null
+	} elseif ($converted.Count -eq 1) {
+		return $converted[0]
+	} else {
+		return $converted
+	}
+}
+
 function Exit-Script {
     param(
         [switch]$Failed
@@ -67,6 +129,143 @@ function Exit-Script {
 	} else {
         exit 0
     }
+}
+
+function Get-ADSIObject {
+	<#
+		Performs large/efficient AD queries using the System.DirectoryServices.DirectorySearcher
+		.NET class rather than the ActiveDirectory cmdlets. DirectorySearcher paging (PageSize)
+		transparently retrieves result sets larger than the server's MaxPageSize (1000 by default),
+		which makes this suitable for enumerating every user/computer/group in a large directory.
+
+		Binary attributes (objectSid, objectGUID) and Integer8/FileTime date attributes
+		(pwdLastSet, lastLogonTimestamp, accountExpires, etc.) are converted to friendly types.
+
+		Examples:
+			# Every enabled user, returning a handful of attributes
+			Get-ADSIObject -ObjectType User -Properties sAMAccountName,displayName,lastLogonTimestamp
+
+			# Arbitrary class via a raw LDAP filter
+			Get-ADSIObject -ObjectType Other -LdapFilter "(objectClass=organizationalUnit)" -Properties name,distinguishedName
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter()][ValidateSet("User","Group","Computer","Other")]$ObjectType = "User", # if "Other", the LdapFilter MUST be included and can/should include the objectClass
+		[Parameter()][string[]]$Properties,
+		[Parameter()][string[]]$LdapFilter,
+		[Parameter()][string]$SearchBase,
+		[Parameter()][ValidateSet("Base","OneLevel","Subtree")][string]$SearchScope = "Subtree",
+		[Parameter()][string]$Server,
+		[Parameter()][int]$PageSize,
+		[Parameter()][switch]$FindOne
+	)
+
+	# --- Build the LDAP filter -------------------------------------------------
+	# Per-type base filter; "Other" relies entirely on the caller-supplied -LdapFilter.
+	$typeFilter = switch ($ObjectType) {
+		"User" { "(&(objectCategory=person)(objectClass=user))" }
+		"Group" { "(objectCategory=group)" }
+		"Computer" { "(objectCategory=computer)" }
+		"Other" { $null }
+	}
+
+	if ($ObjectType -eq "Other" -and -not $LdapFilter) {
+		Write-Log "Get-ADSIObject: -ObjectType 'Other' requires an -LdapFilter (including the objectClass/objectCategory)." -Level ERROR
+		return
+	}
+
+	# Caller clauses are ANDed together with the type filter. Each -LdapFilter element should be a
+	# complete clause, e.g. "(mail=*)" or "(userAccountControl:1.2.840.113556.1.4.803:=2)".
+	$clauses = @()
+	if ($typeFilter) { $clauses += $typeFilter }
+	if ($LdapFilter) { $clauses += $LdapFilter }
+
+	if ($clauses.Count -gt 1) {
+		$filter = "(&" + ($clauses -join "") + ")"
+	} elseif ($clauses.Count -eq 1) {
+		$filter = $clauses[0]
+	} else {
+		$filter = "(objectClass=*)"
+	}
+
+	# --- Build the directory binding -------------------------------------------
+	# Resolve credentials from the module-wide splat when present.
+	$cred = $null
+	if ($global:CredSplat -and $global:CredSplat["Credential"]) {
+		$cred = $global:CredSplat["Credential"]
+	}
+
+	# Determine the search root path. When no SearchBase is supplied we read the target's
+	# defaultNamingContext from RootDSE so the search covers the whole domain.
+	$searchRoot = $null
+	try {
+		if (-not $SearchBase) {
+			$rootDsePath = "LDAP://" + $(if ($Server) { "$Server/" }) + "RootDSE"
+			$rootDse = New-DirectoryEntry -Path $rootDsePath -Credential $cred
+			$SearchBase = $rootDse.Properties["defaultNamingContext"][0]
+			$rootDse.Dispose()
+		}
+
+		$rootPath = "LDAP://" + $(if ($Server) { "$Server/" }) + $SearchBase
+		$searchRoot = New-DirectoryEntry -Path $rootPath -Credential $cred
+	} catch {
+		Write-Log "Get-ADSIObject: failed to bind to the directory ($rootPath). The specific error is: $_" -Level ERROR
+		if ($searchRoot) { $searchRoot.Dispose() }
+		return
+	}
+
+	# --- Configure the DirectorySearcher ---------------------------------------
+	$searcher = New-Object System.DirectoryServices.DirectorySearcher
+	$searcher.SearchRoot = $searchRoot
+	$searcher.Filter = $filter
+	$searcher.SearchScope = $SearchScope
+	$searcher.PageSize = $PageSize # >0 enables paged retrieval beyond the server MaxPageSize (1000)
+	$searcher.SizeLimit = 0 # 0 = no client-imposed cap; paging returns the full set
+
+	if ($Properties) {
+		# DirectorySearcher only returns the attributes named in PropertiesToLoad once it is populated.
+		[void]$searcher.PropertiesToLoad.AddRange($Properties)
+	}
+
+	Write-Log "Get-ADSIObject: searching '$($searchRoot.Path)' (scope=$SearchScope, page=$PageSize) with filter $filter" -Level VERBOSE
+
+	# --- Execute and project results -------------------------------------------
+	$rawResults = $null
+	try {
+		if ($FindOne) {
+			$rawResults = @($searcher.FindOne())
+		} else {
+			$rawResults = $searcher.FindAll()
+		}
+	} catch {
+		Write-Log "Get-ADSIObject: search failed. The specific error is: $_" -Level ERROR
+		$searcher.Dispose()
+		$searchRoot.Dispose()
+		return
+	}
+
+	$output = foreach ($result in $rawResults) {
+		if (-not $result) { continue }
+
+		$obj = [ordered]@{}
+
+		# When specific properties were requested, project exactly those (preserving order and
+		# emitting $null for absent ones). Otherwise project every attribute the search returned.
+		$propNames = $(if ($Properties) { $Properties } else { $result.Properties.PropertyNames })
+
+		foreach ($prop in $propNames) {
+			$obj[$prop] = ConvertFrom-ADSIValue -Name $prop -Values $result.Properties[$prop]
+		}
+
+		[pscustomobject]$obj
+	}
+
+	# FindAll() returns a SearchResultCollection that holds unmanaged handles; dispose it explicitly.
+	if ($rawResults -is [System.DirectoryServices.SearchResultCollection]) { $rawResults.Dispose() }
+	$searcher.Dispose()
+	$searchRoot.Dispose()
+
+	return $output
 }
 
 function Get-DC {
@@ -642,6 +841,21 @@ function Initialize-Module {
 	}
 }
 
+function New-DirectoryEntry {
+	# Thin wrapper that builds a System.DirectoryServices.DirectoryEntry, binding with the supplied
+	# PSCredential when one is provided and otherwise using the caller's current security context.
+	param(
+		[Parameter(Mandatory=$true)][string]$Path,
+		[System.Management.Automation.PSCredential]$Credential
+	)
+
+	if ($Credential) {
+		return New-Object System.DirectoryServices.DirectoryEntry($Path, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+	} else {
+		return New-Object System.DirectoryServices.DirectoryEntry($Path)
+	}
+}
+
 function New-Email {
 	param(
 		[string]$From,
@@ -769,7 +983,7 @@ function Split-CamelCaseString {
         $words = $String -csplit $pattern | Where-Object { $_ -ne '' }
         
 		if ($CapitalizeEachWord) {
-			$words = $words | foreach {$TextCulture.ToTitleCase($_)}
+			$words = $words | ForEach-Object {$TextCulture.ToTitleCase($_)}
 		}
 
 		if ($ReturnArray) {
