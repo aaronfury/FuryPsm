@@ -132,22 +132,6 @@ function Exit-Script {
 }
 
 function Get-ADSIObject {
-	<#
-		Performs large/efficient AD queries using the System.DirectoryServices.DirectorySearcher
-		.NET class rather than the ActiveDirectory cmdlets. DirectorySearcher paging (PageSize)
-		transparently retrieves result sets larger than the server's MaxPageSize (1000 by default),
-		which makes this suitable for enumerating every user/computer/group in a large directory.
-
-		Binary attributes (objectSid, objectGUID) and Integer8/FileTime date attributes
-		(pwdLastSet, lastLogonTimestamp, accountExpires, etc.) are converted to friendly types.
-
-		Examples:
-			# Every enabled user, returning a handful of attributes
-			Get-ADSIObject -ObjectType User -Properties sAMAccountName,displayName,lastLogonTimestamp
-
-			# Arbitrary class via a raw LDAP filter
-			Get-ADSIObject -ObjectType Other -LdapFilter "(objectClass=organizationalUnit)" -Properties name,distinguishedName
-	#>
 	[CmdletBinding()]
 	param(
 		[Parameter()][ValidateSet("User","Group","Computer","Other")]$ObjectType = "User", # if "Other", the LdapFilter MUST be included and can/should include the objectClass
@@ -156,11 +140,10 @@ function Get-ADSIObject {
 		[Parameter()][string]$SearchBase,
 		[Parameter()][ValidateSet("Base","OneLevel","Subtree")][string]$SearchScope = "Subtree",
 		[Parameter()][string]$Server,
-		[Parameter()][int]$PageSize,
+		[Parameter()][int]$PageSize = 1000,
 		[Parameter()][switch]$FindOne
 	)
 
-	# --- Build the LDAP filter -------------------------------------------------
 	# Per-type base filter; "Other" relies entirely on the caller-supplied -LdapFilter.
 	$typeFilter = switch ($ObjectType) {
 		"User" { "(&(objectCategory=person)(objectClass=user))" }
@@ -174,8 +157,6 @@ function Get-ADSIObject {
 		return
 	}
 
-	# Caller clauses are ANDed together with the type filter. Each -LdapFilter element should be a
-	# complete clause, e.g. "(mail=*)" or "(userAccountControl:1.2.840.113556.1.4.803:=2)".
 	$clauses = @()
 	if ($typeFilter) { $clauses += $typeFilter }
 	if ($LdapFilter) { $clauses += $LdapFilter }
@@ -188,48 +169,36 @@ function Get-ADSIObject {
 		$filter = "(objectClass=*)"
 	}
 
-	# --- Build the directory binding -------------------------------------------
-	# Resolve credentials from the module-wide splat when present.
-	$cred = $null
-	if ($global:CredSplat -and $global:CredSplat["Credential"]) {
-		$cred = $global:CredSplat["Credential"]
-	}
-
-	# Determine the search root path. When no SearchBase is supplied we read the target's
-	# defaultNamingContext from RootDSE so the search covers the whole domain.
 	$searchRoot = $null
 	try {
 		if (-not $SearchBase) {
 			$rootDsePath = "LDAP://" + $(if ($Server) { "$Server/" }) + "RootDSE"
-			$rootDse = New-DirectoryEntry -Path $rootDsePath -Credential $cred
+			$rootDse = New-DirectoryEntry -Path $rootDsePath @CredSplat
 			$SearchBase = $rootDse.Properties["defaultNamingContext"][0]
 			$rootDse.Dispose()
 		}
 
 		$rootPath = "LDAP://" + $(if ($Server) { "$Server/" }) + $SearchBase
-		$searchRoot = New-DirectoryEntry -Path $rootPath -Credential $cred
+		$searchRoot = New-DirectoryEntry -Path $rootPath @CredSplat
 	} catch {
 		Write-Log "Get-ADSIObject: failed to bind to the directory ($rootPath). The specific error is: $_" -Level ERROR
 		if ($searchRoot) { $searchRoot.Dispose() }
 		return
 	}
 
-	# --- Configure the DirectorySearcher ---------------------------------------
 	$searcher = New-Object System.DirectoryServices.DirectorySearcher
 	$searcher.SearchRoot = $searchRoot
 	$searcher.Filter = $filter
 	$searcher.SearchScope = $SearchScope
-	$searcher.PageSize = $PageSize # >0 enables paged retrieval beyond the server MaxPageSize (1000)
-	$searcher.SizeLimit = 0 # 0 = no client-imposed cap; paging returns the full set
+	$searcher.PageSize = $PageSize
+	$searcher.SizeLimit = 0
 
 	if ($Properties) {
-		# DirectorySearcher only returns the attributes named in PropertiesToLoad once it is populated.
 		[void]$searcher.PropertiesToLoad.AddRange($Properties)
 	}
 
 	Write-Log "Get-ADSIObject: searching '$($searchRoot.Path)' (scope=$SearchScope, page=$PageSize) with filter $filter" -Level VERBOSE
 
-	# --- Execute and project results -------------------------------------------
 	$rawResults = $null
 	try {
 		if ($FindOne) {
@@ -249,8 +218,6 @@ function Get-ADSIObject {
 
 		$obj = [ordered]@{}
 
-		# When specific properties were requested, project exactly those (preserving order and
-		# emitting $null for absent ones). Otherwise project every attribute the search returned.
 		$propNames = $(if ($Properties) { $Properties } else { $result.Properties.PropertyNames })
 
 		foreach ($prop in $propNames) {
@@ -260,7 +227,6 @@ function Get-ADSIObject {
 		[pscustomobject]$obj
 	}
 
-	# FindAll() returns a SearchResultCollection that holds unmanaged handles; dispose it explicitly.
 	if ($rawResults -is [System.DirectoryServices.SearchResultCollection]) { $rawResults.Dispose() }
 	$searcher.Dispose()
 	$searchRoot.Dispose()
