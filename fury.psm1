@@ -64,7 +64,7 @@ function ConvertFrom-ADSIValue {
 						(New-Object System.Security.Principal.SecurityIdentifier($value, 0)).Value
 						break
 					}
-					"objectguid" {
+					{ @("ms-DS-ConsistencyGuid", "objectguid") -contains $_ } {
 						(New-Object System.Guid(,$value)).ToString()
 						break
 					}
@@ -141,6 +141,7 @@ function Get-ADSIObject {
 		[Parameter()][ValidateSet("Base","OneLevel","Subtree")][string]$SearchScope = "Subtree",
 		[Parameter()][string]$Server,
 		[Parameter()][int]$PageSize = 1000,
+		[Parameter()][int]$SizeLimit = 0,
 		[Parameter()][switch]$FindOne
 	)
 
@@ -191,7 +192,7 @@ function Get-ADSIObject {
 	$searcher.Filter = $filter
 	$searcher.SearchScope = $SearchScope
 	$searcher.PageSize = $PageSize
-	$searcher.SizeLimit = 0
+	$searcher.SizeLimit = $SizeLimit
 
 	if ($Properties) {
 		[void]$searcher.PropertiesToLoad.AddRange($Properties)
@@ -1037,10 +1038,10 @@ function Write-Data {
 	process {
 		switch ($WriteType) {
 			"csv" {
-				[pscustomobject]$Record | Export-Csv -Append -Path $OutputFile -NoTypeInformation -Force -Encoding ASCII
+				[pscustomobject]$Record | Export-Csv -Append -Path $OutputFile -NoTypeInformation -Force -Encoding utf8
 			}
 			"text" {
-				[pscustomobject]$Record | Out-File -FilePath $OutputFile -Append -Encoding ASCII
+				[pscustomobject]$Record | Out-File -FilePath $OutputFile -Append -Encoding utf8
 			}
 			"json" {
 				ConvertTo-Json $Record -Depth 10 | Out-File -FilePath $OutputFile -Append -Encoding utf8
